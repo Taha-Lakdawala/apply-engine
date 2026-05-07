@@ -1,0 +1,52 @@
+# Copy this file to profile.yaml and fill in your details.
+# Anything you put here is sent to Claude to answer unknown questions,
+# so include enough context that AI-generated answers sound like you.
+
+personal:
+  first_name: ""
+  last_name: ""
+  preferred_name: ""
+  email: ""
+  phone: ""
+  pronouns: ""
+
+location:
+  city: ""
+  state: ""
+  country: ""
+  postal_code: ""
+
+links:
+  linkedin: ""
+  github: ""
+  website: ""
+  portfolio: ""
+  twitter: ""
+
+work_authorization:
+  authorized_to_work: true     # in your target country
+  requires_sponsorship: false
+  visa_status: ""              # e.g. "US Citizen", "H1B", "F1 OPT"
+
+# Optional EEO / demographic answers. Many applications mark these "Decline to self-identify" as valid.
+demographics:
+  gender: "Decline to self-identify"
+  race_ethnicity: "Decline to self-identify"
+  veteran_status: "Decline to self-identify"
+  disability_status: "Decline to self-identify"
+  hispanic_or_latino: "Decline to self-identify"
+
+# Free-form context. Write whatever helps Claude answer "tell us about yourself"-style questions
+# in your voice. Two or three paragraphs is fine.
+bio: |
+  Write a few paragraphs about yourself: what you do, what you care about,
+  recent projects, what you're looking for in your next role, and any
+  recurring themes you'd want included in cover-letter-style answers.
+
+# Common short answers you've already worked out. The engine prefers these over AI-generated ones.
+preset_answers:
+  # "How did you hear about this job?": "LinkedIn"
+  # "Years of experience with Python": "5"
+
+# Path to your resume (PDF or DOCX). Relative to repo root or absolute.
+resume_path: "resume.pdf"

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# Env / secrets
+.env
+.env.local
+
+# User data (never commit personal data)
+profile.yaml
+data/
+resume.pdf
+resume.docx
+*.pdf
+*.docx
+
+# Playwright
+playwright-report/
+test-results/
+.playwright/
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
