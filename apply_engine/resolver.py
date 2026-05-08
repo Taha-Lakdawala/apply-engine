@@ -17,6 +17,7 @@ class ResolvedAnswer:
 
 
 _NORMALIZE_RE = re.compile(r"[^a-z0-9 ]+")
+_SALARY_RE = re.compile(r"\b(salary|compensation|pay|remuneration|ctc|package|stipend|wage)\b")
 
 
 def normalize_question(text: str) -> str:
@@ -37,14 +38,29 @@ PROFILE_MAPPINGS: list[tuple[str, str]] = [
     (r"^(phone|telephone|mobile|cell)( number)?$", "personal.phone"),
     (r"pronoun", "personal.pronouns"),
     (r"^country$", "location.country"),
-    (r"^city$", "location.city"),
+    (r"\bcity\b", "location.city"),
     (r"^(state|province|region)$", "location.state"),
-    (r"(postal|zip)\s*code|postcode", "location.postal_code"),
+    (r"(postal|zip)\s*code|postcode|\bpincode\b|\bpin\s*code\b", "location.postal_code"),
+    (r"\bstreet\s*address\b|\baddress\s*(line\s*)?1\b", "location.address_line1"),
     (r"linkedin", "links.linkedin"),
     (r"github", "links.github"),
     (r"^(personal\s*)?website$|portfolio", "links.website"),
     (r"twitter|x\.com", "links.twitter"),
+    (r"\bschool\b|\buniversity\b|\bcollege\b|\binstitution\b", "education.institution"),
+    (r"\bdegree\b|\bfield of study\b", "education.degree_level"),
+    (r"\bdiscipline\b|\bfield\s+of\s+study\b|\bacademic\s+major\b|\byour\s+major\b|^major\s*$|\bconcentration\b", "education.major"),
+    (r"\bstart\s*(date\s*)?year\b|\beducation\s*start\s*year\b", "education.start_year"),
+    (r"\bend\s*(date\s*)?year\b|\beducation\s*end\s*year\b|\bgraduation year\b|\bgrad year\b|\byear of graduation\b", "education.graduation_year"),
+    (r"\bgpa\b|\bgrade point\b|\bcgpa\b", "education.gpa"),
+    (r"\b(current\s+)?ctc\b|\bcost\s+to\s+company\b", "compensation.current_ctc"),
+    (r"\bectc\b|\bexpected\s+(ctc|cost\s+to\s+company)\b", "compensation.expected_ctc"),
 ]
+
+
+def _matches_option(value: str, options: list[str]) -> bool:
+    """True if value case-insensitively matches any option exactly."""
+    v = value.strip().lower()
+    return any(o.strip().lower() == v for o in options)
 
 
 def _profile_lookup(question: str, profile: Profile) -> str | None:
@@ -76,10 +92,15 @@ def _resolve_path(data: dict[str, Any], path: str) -> Any:
     return cur
 
 
+def _is_salary_question(question: str) -> bool:
+    return bool(_SALARY_RE.search(normalize_question(question)))
+
+
 def try_known_resolve(
     field: ai.FieldSpec,
     profile: Profile,
     source_url: str,
+    job_location: str | None = None,
 ) -> tuple[int, ResolvedAnswer | None]:
     """Upsert the question. Try preset/profile/stored. Returns (question_id, answer-or-None)."""
     fingerprint = normalize_question(field.question)
@@ -101,10 +122,19 @@ def try_known_resolve(
         # 2. Direct profile lookup (name / email / links / location).
         profile_value = _profile_lookup(field.question, profile)
         if profile_value is not None:
+            # For constrained select fields, only use the profile value if it
+            # exactly matches one of the available options; otherwise let AI pick.
+            if field.options and not _matches_option(profile_value, field.options):
+                profile_value = None
+        if profile_value is not None:
             answer_id = db.insert_answer(conn, question.id, profile_value, ai_generated=False, source_url=source_url)
             return question.id, ResolvedAnswer(value=profile_value, source="profile", question_id=question.id, answer_id=answer_id)
 
-        # 3. Reuse stored answer if we have one.
+        # 3. Reuse stored answer — but salary questions always go to AI so the
+        #    answer can be adapted to the job's country via PPP.
+        if _is_salary_question(field.question):
+            return question.id, None
+
         stored = db.latest_answer(conn, question.id)
         if stored is not None:
             return question.id, ResolvedAnswer(

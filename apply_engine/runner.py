@@ -55,12 +55,13 @@ def apply_to_url(
         console.print(f"[bold]Found {len(fields)} fields[/bold] on {url}")
 
         # ---- Phase 1: deterministic resolution (preset / profile / stored) ----
+        job_location = meta.location
         resolved: dict[str, resolver.ResolvedAnswer] = {}
         unknowns: list[tuple[greenhouse.Field, int]] = []  # (field, question_id)
         for f in fields:
             if f.type == "file":
                 continue  # handled in fill phase
-            qid, answer = resolver.try_known_resolve(f.to_field_spec(), profile, source_url=url)
+            qid, answer = resolver.try_known_resolve(f.to_field_spec(), profile, source_url=url, job_location=job_location)
             if answer is not None:
                 resolved[f.key] = answer
             else:
@@ -71,7 +72,17 @@ def apply_to_url(
             console.print(f"[bold]Calling Gemini for {len(unknowns)} unknown field(s)...[/bold]")
             prior_qa = resolver.get_prior_qa()
             specs = [(f.key, f.to_field_spec()) for f, _ in unknowns]
-            ai_answers = ai.answer_fields_batch(specs, profile.as_context(), prior_qa)
+            unknown_keys = {f.key for f, _ in unknowns}
+            form_order = [
+                (f.label, resolved[f.key].value if f.key in resolved else None)
+                for f in fields
+                if f.type != "file" and (f.key in resolved or f.key in unknown_keys)
+            ]
+            ai_answers = ai.answer_fields_batch(
+                specs, profile.as_context(), prior_qa,
+                job_location=job_location, job_url=url,
+                form_order=form_order or None,
+            )
             for f, qid in unknowns:
                 value = ai_answers.get(f.key, "")
                 if value.strip():
@@ -183,24 +194,46 @@ def apply_to_url(
                     "[yellow]Security-code step detected but didn't complete. "
                     "Check the screenshot — code field may have different markup.[/yellow]"
                 )
+            elif status == "invalid":
+                errors = greenhouse.find_form_errors(page)
+                console.print("[red]Submit failed — form has validation errors:[/red]")
+                for e in errors:
+                    console.print(f"  [red]✗ {e['field']}: {e['message']}[/red]")
+                report.error = "; ".join(f"{e['field']}: {e['message']}" for e in errors) or "form invalid"
             else:
-                console.print(
-                    "[yellow]Submit clicked, no confirmation marker detected.[/yellow]\n"
-                    "[yellow]Check the screenshot above OR your email to verify.[/yellow]"
-                )
-                report.submitted = True
+                # No success marker, no obvious errors. Still uncertain — but check once more
+                # in case errors only appeared after the initial wait.
+                errors = greenhouse.find_form_errors(page)
+                if errors:
+                    console.print("[red]Submit failed — form has validation errors:[/red]")
+                    for e in errors:
+                        console.print(f"  [red]✗ {e['field']}: {e['message']}[/red]")
+                    report.error = "; ".join(f"{e['field']}: {e['message']}" for e in errors)
+                else:
+                    console.print(
+                        "[yellow]Submit clicked, no confirmation marker detected.[/yellow]\n"
+                        "[yellow]Check the screenshot above OR your email to verify.[/yellow]"
+                    )
+                    report.submitted = True
 
             page.wait_for_timeout(3000)
         else:
             console.print("\n[yellow]Skipping submit (--no-submit).[/yellow]")
 
         with db.connect() as conn:
+            if report.submitted:
+                final_status = "submitted"
+            elif report.error:
+                final_status = "failed"
+            else:
+                final_status = "filled"
             db.record_application(
                 conn,
                 url=url,
                 company=meta.company,
                 job_title=meta.title,
-                status="submitted" if report.submitted else "filled",
+                status=final_status,
+                error=report.error,
             )
     except Exception as e:
         report.error = str(e)
@@ -243,7 +276,7 @@ def _wait_for_security_code(
     if gmail_addr and app_password and gmail_addr.endswith("@gmail.com"):
         console.print(f"[dim]Polling Gmail ({gmail_addr}) for the code...[/dim]")
         code = email_fetcher.fetch_security_code(
-            gmail_addr, app_password, started_at=started_at, timeout_seconds=120
+            gmail_addr, app_password, started_at=started_at, timeout_seconds=300
         )
         if code:
             console.print(f"[green]Pulled code from Gmail: {_redact(code)}[/green]")

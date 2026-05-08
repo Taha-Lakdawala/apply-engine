@@ -8,10 +8,16 @@ import time
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
-GREENHOUSE_FROM = "no-reply@us.greenhouse-mail.io"
+from rich.console import Console
+
+# Greenhouse has used several sender domains over the years. We filter on the substring
+# 'greenhouse' in the From header rather than a single fixed address.
+GREENHOUSE_FROM_HINT = "greenhouse"
 SUBJECT_HINT = "security code"
 IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
+
+_console = Console()
 
 
 def fetch_security_code(
@@ -28,14 +34,26 @@ def fetch_security_code(
     """
     started_at = started_at or (datetime.now(timezone.utc) - timedelta(seconds=10))
     deadline = time.time() + timeout_seconds
+    first_error: str | None = None
+    attempts = 0
     while time.time() < deadline:
+        attempts += 1
         try:
             code = _try_fetch(email_addr, app_password, started_at)
             if code:
                 return code
-        except Exception:
-            pass  # transient connection / auth issue — retry
+        except imaplib.IMAP4.error as e:
+            # Auth / protocol errors won't recover by retrying — surface immediately.
+            _console.print(f"[red]Gmail IMAP error: {e}[/red]")
+            return None
+        except Exception as e:
+            if first_error is None:
+                first_error = f"{type(e).__name__}: {e}"
         time.sleep(poll_interval)
+    if first_error:
+        _console.print(f"[yellow]Gmail poll: every attempt failed. First error: {first_error}[/yellow]")
+    else:
+        _console.print(f"[yellow]Gmail poll: no matching email after {attempts} attempts.[/yellow]")
     return None
 
 
@@ -43,9 +61,16 @@ def _try_fetch(email_addr: str, app_password: str, started_at: datetime) -> str 
     M = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     try:
         M.login(email_addr, app_password)
-        M.select("INBOX", readonly=True)
+        # Search "All Mail" so we catch messages routed to Promotions/Updates/labels
+        # that bypass the inbox.
+        folder = _find_all_mail(M) or "INBOX"
+        typ, _ = M.select(f'"{folder}"', readonly=True)
+        if typ != "OK":
+            M.select("INBOX", readonly=True)
         since_str = started_at.strftime("%d-%b-%Y")
-        typ, data = M.search(None, f'(FROM "{GREENHOUSE_FROM}" SINCE "{since_str}")')
+        # Search by subject only; filter by sender in Python so we tolerate the various
+        # greenhouse-mail.io / greenhouse.io domains they've sent from.
+        typ, data = M.search(None, f'(SUBJECT "{SUBJECT_HINT}" SINCE "{since_str}")')
         if typ != "OK" or not data or not data[0]:
             return None
         ids = data[0].split()
@@ -57,8 +82,8 @@ def _try_fetch(email_addr: str, app_password: str, started_at: datetime) -> str 
             msg = email.message_from_bytes(raw)
             if not _is_recent(msg, started_at):
                 continue
-            subject = (msg.get("Subject") or "").lower()
-            if SUBJECT_HINT not in subject:
+            sender = (msg.get("From") or "").lower()
+            if GREENHOUSE_FROM_HINT not in sender:
                 continue
             body = _get_body(msg)
             code = _extract_code(body)
@@ -69,6 +94,22 @@ def _try_fetch(email_addr: str, app_password: str, started_at: datetime) -> str 
             M.logout()
         except Exception:
             pass
+    return None
+
+
+def _find_all_mail(M: imaplib.IMAP4_SSL) -> str | None:
+    """Return the Gmail 'All Mail' folder name (locale-independent via the \\All flag)."""
+    typ, mailboxes = M.list()
+    if typ != "OK" or not mailboxes:
+        return None
+    for mb in mailboxes:
+        if not mb:
+            continue
+        line = mb.decode("utf-8", errors="ignore") if isinstance(mb, bytes) else str(mb)
+        if "\\All" in line:
+            m = re.search(r'"([^"]+)"\s*$', line)
+            if m:
+                return m.group(1)
     return None
 
 
@@ -127,14 +168,16 @@ def _extract_code(body: str) -> str | None:
     if m:
         return m.group(1)
 
-    # Fallback: any line that's a single 6–12 char alphanumeric token, with both
-    # letters and digits (so we don't pick up "Greenhouse" or pure year numbers).
+    # Fallback: any line that's a single 6–12 char alphanumeric token that contains
+    # at least one letter (avoids bare years like "2026") and is mixed-case or has digits
+    # (avoids common English words). Greenhouse codes can be all-letter (e.g. "frvCRokn").
     for line in body.splitlines():
         s = line.strip()
         if not _CODE_TOKEN.fullmatch(s):
             continue
         has_letter = any(c.isalpha() for c in s)
         has_digit = any(c.isdigit() for c in s)
-        if has_letter and has_digit:
+        has_mixed_case = any(c.isupper() for c in s) and any(c.islower() for c in s)
+        if has_letter and (has_digit or has_mixed_case):
             return s
     return None

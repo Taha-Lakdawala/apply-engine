@@ -136,6 +136,37 @@ def confirm(question_id: int = typer.Argument(...)) -> None:
     console.print("[green]Marked reviewed.[/green]")
 
 
+@app.command(name="check-gmail")
+def check_gmail_cmd() -> None:
+    """Smoke-test the Gmail IMAP connection used to pull Greenhouse security codes."""
+    import os
+    from datetime import datetime, timedelta, timezone
+    from . import email_fetcher
+
+    profile = load_profile()
+    addr = (profile.data.get("personal") or {}).get("email") or ""
+    pw = os.environ.get("GMAIL_APP_PASSWORD")
+    if not addr.endswith("@gmail.com"):
+        console.print(f"[red]Profile email is not a gmail.com address: {addr!r}[/red]")
+        raise typer.Exit(1)
+    if not pw:
+        console.print("[red]GMAIL_APP_PASSWORD is not set.[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"Connecting to Gmail as {addr}...")
+    started_at = datetime.now(timezone.utc) - timedelta(days=7)
+    code = email_fetcher.fetch_security_code(
+        addr, pw, started_at=started_at, timeout_seconds=15, poll_interval=5.0,
+    )
+    if code:
+        console.print(f"[green]Found a recent security code: {code[:2]}***{code[-2:]}[/green]")
+    else:
+        console.print(
+            "[yellow]Connected, but no Greenhouse security-code email in the last 7 days.[/yellow]\n"
+            "[dim]Check that Greenhouse codes aren't being filtered out of All Mail.[/dim]"
+        )
+
+
 @app.command(name="list")
 def list_cmd() -> None:
     """List every stored question and its current answer."""

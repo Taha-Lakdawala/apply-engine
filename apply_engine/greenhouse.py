@@ -136,7 +136,21 @@ EXTRACT_JS = r"""
     return null;
   };
 
-  const form = document.querySelector('form#application_form, form#application-form, form[action*="apply"], form');
+  // Prefer known Greenhouse identifiers; otherwise pick the form with the most
+  // non-hidden inputs (application forms have many fields; search/nav forms have few).
+  let form = document.querySelector(
+    '#grnhse_app form, form#application_form, form#application-form, form[action*="greenhouse.io"]'
+  );
+  if (!form) {
+    let best = null, bestCount = -1;
+    for (const f of document.querySelectorAll('form')) {
+      const n = f.querySelectorAll(
+        'input:not([type="hidden"]):not([type="submit"]):not([type="button"]), select, textarea'
+      ).length;
+      if (n > bestCount) { bestCount = n; best = f; }
+    }
+    form = best;
+  }
   if (!form) return [];
 
   const fields = [];
@@ -290,6 +304,7 @@ class Field:
 class PageMeta:
     title: str | None
     company: str | None
+    location: str | None = None
 
 
 # How many options before we treat a combobox as a free-text searchable field
@@ -297,18 +312,216 @@ class PageMeta:
 SEARCHABLE_THRESHOLD = 25
 
 
+_DISMISS_OVERLAYS_JS = r"""
+() => {
+  // Try to close common cookie/consent/sticky banners that intercept pointer events.
+  const acceptRe = /^(accept|close|dismiss|got it|okay|ok|i agree|agree|continue|confirm|allow)/i;
+
+  // Known IDs / classes that appear on top of forms
+  const bannerRoots = Array.from(document.querySelectorAll(
+    '#relyance-banner-container, #gtmStickyBanner, '
+    + '[id*="cookie"], [id*="consent"], [id*="gdpr"], [id*="privacy-banner"], '
+    + '[class*="cookie-banner"], [class*="cookieBanner"], [class*="consent-banner"], '
+    + '[class*="privacy-banner"], [class*="sticky-banner"]'
+  ));
+
+  for (const root of bannerRoots) {
+    const cs = getComputedStyle(root);
+    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+
+    // First try clicking a close/accept button inside it
+    const btns = Array.from(root.querySelectorAll('button, [role="button"], a[role="button"]'));
+    let clicked = false;
+    for (const btn of btns) {
+      const lbl = (btn.getAttribute('aria-label') || '').trim();
+      const txt = (btn.textContent || '').replace(/\s+/g, ' ').trim();
+      if (acceptRe.test(txt) || /close|dismiss|accept/i.test(lbl)) {
+        try { btn.click(); } catch (e) {}
+        clicked = true;
+        break;
+      }
+    }
+
+    if (!clicked) {
+      // If there is no obvious button, just neutralise pointer interception
+      root.style.setProperty('pointer-events', 'none', 'important');
+      // Also hide dialogs inside (they block scroll-into-view too)
+      root.querySelectorAll('[role="dialog"]').forEach(d => {
+        d.style.setProperty('pointer-events', 'none', 'important');
+      });
+    }
+  }
+
+  // Catch-all: any fixed/sticky modal dialog that is NOT the application form itself
+  document.querySelectorAll('[role="dialog"][aria-modal="true"]').forEach(el => {
+    const cs = getComputedStyle(el);
+    if (cs.position !== 'fixed' && cs.position !== 'sticky') return;
+    // If it is not inside a <form>, it is an overlay — neutralise it
+    if (!el.closest('form')) {
+      el.style.setProperty('pointer-events', 'none', 'important');
+    }
+  });
+}
+"""
+
+
+def _dismiss_overlays(page: Page) -> None:
+    """Best-effort removal of cookie/consent/sticky banners that block form interaction."""
+    try:
+        page.evaluate(_DISMISS_OVERLAYS_JS)
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+
+def _find_greenhouse_iframe_url(page: Page) -> str | None:
+    """Return the URL of any Greenhouse embed iframe/frame on the page, or None.
+
+    Uses Playwright's native frame registry first (catches dynamically-created iframes
+    that may not yet have their src attribute set in the DOM), then falls back to a JS
+    scan of the DOM for iframes whose src property matches greenhouse.io."""
+    # Native frame list — most reliable; Playwright registers frames as they're created.
+    for frame in page.frames:
+        url = frame.url
+        if "greenhouse.io" in url and url != page.url:
+            return url
+    # JS fallback for iframes that exist in the DOM but haven't become separate frames yet.
+    return page.evaluate(
+        r"""() => {
+            for (const f of document.querySelectorAll('iframe')) {
+                const src = f.src || f.getAttribute('data-src') || '';
+                if (/greenhouse\.io/i.test(src)) return src;
+            }
+            return null;
+        }"""
+    )
+
+
+def _try_follow_apply_link(page: Page) -> "Page | None":
+    """On a job-description page with no form fields, look for an apply link/button and
+    follow it. Returns the page containing the application form (same page after navigation
+    or a newly-opened tab), or None if no navigation occurred."""
+    # 1. Direct link to greenhouse.io in page HTML — navigate immediately
+    gh_link: str | None = page.evaluate(
+        r"""() => {
+            const applyRe = /apply/i;
+            for (const a of document.querySelectorAll('a')) {
+                const href = a.href || '';
+                if (!/greenhouse\.io/i.test(href)) continue;
+                const txt = (a.textContent || '').replace(/\s+/g, ' ').trim();
+                if (applyRe.test(txt) || applyRe.test(href)) return href;
+            }
+            const any = document.querySelector('a[href*="greenhouse.io"]');
+            return any ? any.href : null;
+        }"""
+    )
+    if gh_link:
+        page.goto(gh_link, wait_until="domcontentloaded")
+        return page
+
+    # 2. Click an "Apply" button/link; handle both new-tab and same-tab navigation
+    apply_btns = page.locator(
+        'a:has-text("Apply for this job"), button:has-text("Apply for this job"), '
+        'a:has-text("Apply Now"), button:has-text("Apply Now"), '
+        'a:has-text("Apply"), button:has-text("Apply")'
+    )
+    if apply_btns.count() == 0:
+        return None
+
+    prev_url = page.url
+    context = page.context
+    try:
+        with context.expect_page(timeout=3000) as new_page_event:
+            apply_btns.first.click(timeout=5000)
+        new_page = new_page_event.value
+        new_page.wait_for_load_state("domcontentloaded")
+        return new_page
+    except PlaywrightTimeout:
+        pass  # No new tab; check same-tab navigation below
+    except Exception:
+        return None
+
+    try:
+        page.wait_for_url(lambda u: u != prev_url, timeout=5000)
+    except PlaywrightTimeout:
+        pass
+
+    if page.url == prev_url:
+        return None  # No navigation occurred
+
+    # May have landed on a company page that still embeds Greenhouse via iframe
+    if "greenhouse.io" not in page.url:
+        try:
+            page.wait_for_selector("iframe[src*='greenhouse.io']", timeout=5000)
+        except PlaywrightTimeout:
+            pass
+        gh_iframe_url = _find_greenhouse_iframe_url(page)
+        if gh_iframe_url:
+            page.goto(gh_iframe_url, wait_until="domcontentloaded")
+
+    return page
+
+
 def open_application(page_factory, url: str) -> tuple[Page, list[Field], PageMeta]:
     page = page_factory()
     page.goto(url, wait_until="domcontentloaded")
+
+    # If the host page is not itself a Greenhouse domain, wait for all JS to settle
+    # (networkidle) — Greenhouse JS embeds inject the form only after fetching the job
+    # definition, so they appear well after DOMContentLoaded. networkidle is the right
+    # signal rather than a fixed timeout.
+    if "greenhouse.io" not in page.url:
+        try:
+            page.wait_for_load_state("networkidle", timeout=12000)
+        except PlaywrightTimeout:
+            pass
+        gh_iframe_url = _find_greenhouse_iframe_url(page)
+        if gh_iframe_url:
+            page.goto(gh_iframe_url, wait_until="domcontentloaded")
+
+    # Wait for Greenhouse-specific form elements. Generic "form input" fires immediately
+    # from search/nav forms; these selectors only appear once the application form loads.
     try:
-        page.wait_for_selector("form input, form select, form textarea, form [role='combobox']", timeout=15000)
+        page.wait_for_selector(
+            "form#application_form, #grnhse_app form, "
+            "input[name='first_name'], input[name='email']",
+            timeout=12000,
+        )
     except PlaywrightTimeout:
-        pass
-    time.sleep(0.6)
+        # Fall back to any form input if the above never appear.
+        try:
+            page.wait_for_selector(
+                "form input, form select, form textarea, form [role='combobox']",
+                timeout=5000,
+            )
+        except PlaywrightTimeout:
+            pass
+    time.sleep(0.3)
+    _dismiss_overlays(page)
 
     combobox_fields = _extract_comboboxes(page)
     standard = page.evaluate(EXTRACT_JS)
     standard_fields = [Field.from_dict(d) for d in standard]
+
+    # If no application fields found, this is likely a job-description page.
+    # Follow the "Apply" link/button to reach the actual application form.
+    if not combobox_fields and not standard_fields:
+        form_page = _try_follow_apply_link(page)
+        if form_page is not None:
+            page = form_page
+            try:
+                page.wait_for_selector(
+                    "form input, form select, form textarea, form [role='combobox']",
+                    timeout=15000,
+                )
+            except PlaywrightTimeout:
+                pass
+            time.sleep(0.6)
+            _dismiss_overlays(page)
+            combobox_fields = _extract_comboboxes(page)
+            standard = page.evaluate(EXTRACT_JS)
+            standard_fields = [Field.from_dict(d) for d in standard]
+
     return page, combobox_fields + standard_fields, _extract_meta(page)
 
 
@@ -355,6 +568,7 @@ def _extract_comboboxes(page: Page) -> list[Field]:
 def _extract_meta(page: Page) -> PageMeta:
     title = page.title() or None
     company = None
+    location = None
     try:
         company = page.evaluate(
             """() => {
@@ -368,7 +582,41 @@ def _extract_meta(page: Page) -> PageMeta:
         )
     except Exception:
         pass
-    return PageMeta(title=title, company=company)
+    try:
+        location = page.evaluate(
+            """() => {
+                // 1. Dedicated location elements
+                const sel = [
+                    '.location', '[class*="location"]', '[class*="job-location"]',
+                    '[data-qa="job-location"]', '.posting-location', '.job__location',
+                    '.header__location', '.job-header__location', 'span[itemprop="addressLocality"]',
+                    '[itemtype*="JobPosting"] [itemprop="jobLocation"]',
+                ];
+                for (const s of sel) {
+                    const el = document.querySelector(s);
+                    const t = el && el.textContent.trim();
+                    if (t) return t;
+                }
+                // 2. <meta> tags (og:description or structured data sometimes carry it)
+                const metas = document.querySelectorAll('meta[name="description"], meta[property="og:description"]');
+                for (const m of metas) {
+                    const c = (m.getAttribute('content') || '').trim();
+                    if (c) return c;  // caller will use this as a hint only
+                }
+                return null;
+            }"""
+        )
+    except Exception:
+        pass
+
+    # 3. Fall back to page title — Greenhouse titles are often "Role at Company in City, Country"
+    if not location and title:
+        import re as _re
+        m = _re.search(r'\bin\s+([A-Z][^|–—·]+)', title)
+        if m:
+            location = m.group(1).strip()
+
+    return PageMeta(title=title, company=company, location=location)
 
 
 def fill_field(page: Page, field: Field, value: str, resume_path: Path | None = None) -> str | None:
@@ -382,8 +630,18 @@ def fill_field(page: Page, field: Field, value: str, resume_path: Path | None = 
 
     if field.type in {"text", "email", "phone", "url", "number", "date", "textarea"}:
         loc = page.locator(selector).first
-        loc.click()
+        try:
+            loc.click(timeout=5000)
+        except Exception:
+            # An overlay is likely intercepting — neutralise it and force the click.
+            _dismiss_overlays(page)
+            loc.click(force=True)
         loc.fill("")  # clear pre-filled value
+        # Greenhouse location/city inputs are autocomplete typeaheads — typing alone
+        # leaves the form value empty until you pick a suggestion.
+        if _is_location_field(field) and value:
+            _fill_location(page, loc, value)
+            return
         # Slow type for short fields (cadence helps reCAPTCHA score); fill() for long content.
         if field.type == "textarea" or len(value) > 80:
             loc.fill(value)
@@ -487,16 +745,27 @@ def _read_visible_options(page: Page) -> list[str]:
 
 
 def _click_visible_option(page: Page, value: str) -> bool:
-    """Click an option matching value within a visible listbox. Returns True if clicked."""
+    """Click an option matching value within a visible listbox. Returns True if clicked.
+
+    Match priority: exact -> startsWith -> word-boundary -> substring. The naive
+    `includes` fallback alone matches 'British Indian Ocean Territory' for 'India',
+    so we always prefer a word-boundary match before falling back to substring.
+    """
     target_lower = value.strip().lower()
     return page.evaluate(
-        """(target) => {
+        r"""(target) => {
+            const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const escaped = target.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
+            const wordRe = new RegExp('\\b' + escaped + '\\b', 'i');
             const visible = Array.from(document.querySelectorAll('[role="listbox"]'))
                 .filter(lb => lb.offsetParent !== null);
             for (const lb of visible) {
                 const opts = Array.from(lb.querySelectorAll('[role="option"]'));
-                let match = opts.find(o => (o.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase() === target);
-                if (!match) match = opts.find(o => (o.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase().includes(target));
+                if (!opts.length) continue;
+                let match = opts.find(o => norm(o.textContent) === target);
+                if (!match) match = opts.find(o => norm(o.textContent).startsWith(target));
+                if (!match) match = opts.find(o => wordRe.test(norm(o.textContent)));
+                if (!match) match = opts.find(o => norm(o.textContent).includes(target));
                 if (match) { match.click(); return true; }
             }
             return false;
@@ -509,19 +778,107 @@ def _pick_combobox_option(page: Page, selector: str, value: str) -> None:
     page.locator(selector).first.click()
     page.wait_for_timeout(250)
     if not _click_visible_option(page, value):
-        page.keyboard.press("Escape")
-        raise ValueError(f"No combobox option matches {value!r}")
+        if not _click_visible_option(page, "Other"):
+            page.keyboard.press("Escape")
+            raise ValueError(f"No combobox option matches {value!r}")
 
 
 def _type_and_pick(page: Page, selector: str, value: str) -> None:
-    """For long-list comboboxes (countries etc): focus, type, pick best match."""
+    """For long-list comboboxes (countries / city autocompletes): focus, type, then poll
+    for the dropdown to populate before clicking the best-matching option."""
     loc = page.locator(selector).first
     loc.click()
     loc.fill("")
-    loc.type(value, delay=20)
-    page.wait_for_timeout(300)
-    if not _click_visible_option(page, value):
-        page.keyboard.press("Enter")
+    loc.press_sequentially(value, delay=60)
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if _click_visible_option(page, value):
+            page.wait_for_timeout(150)  # let React commit the selection
+            return
+        page.wait_for_timeout(150)
+    # Value not in dropdown — clear and try "Other" as fallback (e.g. unlisted schools).
+    loc.fill("")
+    loc.press_sequentially("Other", delay=60)
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if _click_visible_option(page, "Other"):
+            page.wait_for_timeout(150)
+            return
+        page.wait_for_timeout(150)
+    raise ValueError(f"No combobox option matched {value!r} after typing")
+
+
+def _is_location_field(field: "Field") -> bool:
+    return bool(re.search(r"\b(location|city|town)\b", field.label, re.I))
+
+
+_AUTOCOMPLETE_PICK_JS = r"""
+(target) => {
+  const t = (target || '').trim().toLowerCase();
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const isVisible = (el) => {
+    if (!el || el.offsetParent === null) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
+  };
+
+  // Cast a wide net — Greenhouse location autocompletes have varied across their
+  // releases, and the dropdown is sometimes portaled to <body>.
+  const selectors = [
+    '[role="listbox"] [role="option"]',
+    '[role="option"]',
+    'ul[class*="suggest" i] li',
+    'ul[class*="autocomplete" i] li',
+    'ul[class*="location" i] li',
+    '[class*="suggestions" i] li',
+    '[class*="dropdown" i] [class*="option" i]',
+    '[class*="dropdown" i] [class*="item" i]',
+    '[class*="menu" i] [class*="item" i]',
+    '.pac-container .pac-item',
+    '.geosuggest__item',
+    '[id*="downshift" i] li',
+  ];
+  const candidates = Array.from(document.querySelectorAll(selectors.join(', ')))
+    .filter(isVisible)
+    .filter(el => norm(el.textContent).length > 0);
+  if (!candidates.length) return null;
+
+  // Match by content — never blindly click the first candidate, since [role=option]
+  // elements can come from unrelated comboboxes elsewhere on the page.
+  let pick = candidates.find(o => norm(o.textContent) === t);
+  if (!pick) pick = candidates.find(o => norm(o.textContent).startsWith(t));
+  if (!pick) pick = candidates.find(o => norm(o.textContent).includes(t));
+  if (!pick) return null;
+  pick.scrollIntoView({ block: 'center' });
+  pick.click();
+  return norm(pick.textContent);
+}
+"""
+
+
+def _fill_location(page: Page, loc, value: str) -> bool:
+    """Type a location and commit a suggestion. Polls for the dropdown for up to ~3s
+    because Greenhouse debounces the autocomplete request. Returns True if a suggestion
+    was committed."""
+    loc.press_sequentially(value, delay=80)
+    deadline = time.time() + 3.0
+    picked: str | None = None
+    while time.time() < deadline:
+        try:
+            picked = page.evaluate(_AUTOCOMPLETE_PICK_JS, value)
+        except Exception:
+            picked = None
+        if picked:
+            break
+        page.wait_for_timeout(200)
+    if not picked:
+        return False
+    # Tab off so the React component locks in the selection before we move on.
+    loc.press("Tab")
+    page.wait_for_timeout(150)
+    return True
 
 
 def _escape_attr(s: str) -> str:
@@ -593,11 +950,25 @@ def has_recaptcha(page: Page) -> bool:
 def submit(page: Page) -> str:
     """Click submit, wait for the post-submit DOM to settle into one of the known states,
     and return 'verified', 'unverified', 'blocked', or 'code_required'."""
-    btn = page.locator(
-        'form button[type="submit"], form input[type="submit"], '
-        'button:has-text("Submit Application"), button:has-text("Submit application"), '
+    _dismiss_overlays(page)
+    # Exclude inputs with the HTML `hidden` attribute (e.g. search form submit buttons).
+    btn_loc = page.locator(
+        'form button[type="submit"], '
+        'form input[type="submit"]:not([hidden]), '
+        'button:has-text("Submit Application"), '
+        'button:has-text("Submit application"), '
         'button:has-text("Submit")'
-    ).first
+    )
+    # Walk candidates in DOM order and pick the first one that is actually visible.
+    btn = btn_loc.first
+    for i in range(min(btn_loc.count(), 10)):
+        candidate = btn_loc.nth(i)
+        try:
+            if candidate.is_visible():
+                btn = candidate
+                break
+        except Exception:
+            continue
     btn.click()
     try:
         page.wait_for_load_state("networkidle", timeout=30000)
@@ -632,7 +1003,8 @@ def submit(page: Page) -> str:
 
 def verify_submission(page: Page) -> str:
     """Look for a confirmation marker. 'verified' if we find one, 'blocked' if a captcha
-    error is showing, 'unverified' if neither."""
+    error is showing, 'invalid' if the form is showing field-level errors, 'unverified' if
+    none of the above."""
     state = page.evaluate(
         """() => {
             const text = (document.body.innerText || '').toLowerCase();
@@ -648,7 +1020,108 @@ def verify_submission(page: Page) -> str:
         return "verified"
     if state["captchaError"]:
         return "blocked"
+    if find_form_errors(page):
+        return "invalid"
     return "unverified"
+
+
+_FIND_FORM_ERRORS_JS = r"""
+() => {
+  const out = [];
+  const seen = new Set();
+  const isVisible = (el) => {
+    if (!el) return false;
+    if (el.offsetParent === null) return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+  const clean = (s) => (s || '').replace(/\s+/g, ' ').replace(/\*+$/, '').replace(/\(required\)$/i, '').trim();
+  const labelOf = (el) => {
+    const lblBy = el.getAttribute('aria-labelledby');
+    if (lblBy) {
+      const lbl = document.getElementById(lblBy);
+      if (lbl) { const t = clean(lbl.textContent); if (t) return t; }
+    }
+    if (el.id) {
+      try {
+        const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (lbl) { const t = clean(lbl.textContent); if (t) return t; }
+      } catch (e) {}
+    }
+    const aria = el.getAttribute('aria-label');
+    if (aria) return clean(aria);
+    const wrap = el.closest('.field-wrapper, .field, fieldset, [data-testid], [class*="question"], [class*="Field"]');
+    if (wrap) {
+      const lbl = wrap.querySelector('legend, label, h2, h3, h4, [class*="label"]');
+      if (lbl) return clean(lbl.textContent);
+    }
+    return null;
+  };
+  const push = (field, message) => {
+    const m = clean(message);
+    if (!m) return;
+    if (m.length > 200) return;
+    const key = (field || '') + '||' + m;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ field: field || '?', message: m });
+  };
+
+  // 1. aria-invalid inputs — pull error text from aria-describedby or nearby error nodes.
+  document.querySelectorAll('input[aria-invalid="true"], select[aria-invalid="true"], textarea[aria-invalid="true"], [role="combobox"][aria-invalid="true"]').forEach(el => {
+    const label = labelOf(el);
+    let msg = null;
+    const describedBy = el.getAttribute('aria-describedby');
+    if (describedBy) {
+      describedBy.split(/\s+/).forEach(id => {
+        const e = document.getElementById(id);
+        if (e && isVisible(e)) {
+          const t = clean(e.textContent);
+          if (t) msg = msg ? msg + ' ' + t : t;
+        }
+      });
+    }
+    if (!msg) {
+      const wrap = el.closest('.field-wrapper, .field, fieldset, [data-testid], .form-field, [class*="Field"]');
+      if (wrap) {
+        const e = wrap.querySelector('[class*="error" i]:not([class*="grecaptcha" i]), [role="alert"]');
+        if (e && isVisible(e)) msg = clean(e.textContent);
+      }
+    }
+    push(label, msg || 'invalid');
+  });
+
+  // 2. Visible elements whose class name contains 'error' (excluding captcha) — Greenhouse
+  //    shows field errors as <p class="error">, <div class="form-error">, etc.
+  document.querySelectorAll('form [class*="error" i], form [role="alert"]').forEach(el => {
+    if (el.classList && Array.from(el.classList).some(c => /grecaptcha|captcha/i.test(c))) return;
+    if (!isVisible(el)) return;
+    const text = clean(el.textContent);
+    if (!text) return;
+    if (text.length > 200) return;
+    let label = null;
+    const wrap = el.closest('.field-wrapper, .field, fieldset, [data-testid], .form-field, [class*="Field"]');
+    if (wrap) {
+      const lbl = wrap.querySelector('legend, label, h2, h3, h4, [class*="label" i]');
+      if (lbl) label = clean(lbl.textContent);
+    }
+    push(label, text);
+  });
+
+  return out;
+}
+"""
+
+
+def find_form_errors(page: Page) -> list[dict]:
+    """Return any visible field-level error messages on the form.
+
+    Each entry is `{"field": <label or '?'>, "message": <error text>}`. Empty list means
+    no validation errors are currently displayed."""
+    try:
+        return page.evaluate(_FIND_FORM_ERRORS_JS) or []
+    except Exception:
+        return []
 
 
 _STEALTH_INIT_JS = r"""
