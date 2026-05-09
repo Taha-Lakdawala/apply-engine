@@ -21,6 +21,22 @@ class FieldSpec:
 
 _client: genai.Client | None = None
 
+_AI_CHAR_MAP = str.maketrans({
+    "–": "-",    # en dash
+    "—": "-",    # em dash
+    "‘": "'",    # left single quote
+    "’": "'",    # right single quote
+    "“": '"',    # left double quote
+    "”": '"',    # right double quote
+    "…": "...",  # ellipsis
+    " ": " ",    # non-breaking space
+    "•": "-",    # bullet
+})
+
+
+def _sanitize(text: str) -> str:
+    return text.translate(_AI_CHAR_MAP)
+
 
 def _get_client() -> genai.Client:
     global _client
@@ -50,11 +66,60 @@ Work authorization questions:
 - If the job country matches the candidate's home country (location.country in the profile), always answer eligibility/right-to-work questions with "Yes" and sponsorship-required questions with "No", regardless of what work_authorization.authorized_to_work or requires_sponsorship say.
 - Only apply work_authorization.authorized_to_work / requires_sponsorship when the job is in a country OTHER than the candidate's home country.
 
-Salary questions:
-- If the job is in India: state ₹30,00,000–₹40,00,000 per annum (express as a range, e.g. "₹30,00,000 to ₹40,00,000 per annum").
-- If the job is in any other country: convert using PPP. India's PPP conversion factor is ~25 INR per international dollar. Divide the India midpoint (₹35,00,000) by 25 to get ~$140,000 international dollars, then multiply by the target country's PPP factor (examples: US ~1.0 USD, UK ~0.70 GBP, Eurozone ~0.75 EUR, Canada ~1.30 CAD, Australia ~1.50 AUD, Singapore ~1.30 SGD). Express the result as a range ±15% below the PPP equivalent in the local currency, since the aim is slightly below market.
-- If the job location is unknown, infer the country only from explicit signals in the job URL or location string (e.g. city/country name, country code in subdomain). Do NOT infer from the company name — the company HQ country is irrelevant. Only fall back to the India INR range if there is genuinely no location signal at all.
+Start date / notice period questions:
+- The candidate's notice period is exactly 60 days.
+- When options include both "60 Days" and "60+ Days" (or similar), pick "60 Days" — "60+" means MORE THAN 60 days, which overstates the notice period.
+- In general, prefer the option whose upper bound is closest to (but not less than) the actual notice period.
+
+Salary questions (only reached when the field has predefined options, or for countries not handled deterministically):
+- The candidate's India target is ₹30,00,000–₹40,00,000 per annum (30–40 LPA).
+- When the field is a select/combobox with predefined options: pick the option whose range best covers ₹30–40 LPA (or the equivalent in local currency after PPP conversion). Prefer an option that contains the target rather than one that is below it.
+- When the field is free-text: convert the India target using PPP — divide by 25 INR/intl-dollar to get $120,000–$160,000 international, then multiply by the target country's PPP factor and apply a 10% discount. Examples: US ~1.0 USD, UK ~0.70 GBP, Eurozone ~0.75 EUR, Canada ~1.30 CAD, Australia ~1.50 AUD, Singapore ~1.30 SGD. Express as a rounded range in local currency.
+- Infer the country only from explicit signals in the job URL or location string. Do NOT infer from company name. If truly no signal, use ₹30,00,000 to ₹40,00,000 per annum.
 """
+
+
+def generate_cover_letter(
+    profile_context: str,
+    job_title: str | None,
+    company: str | None,
+    job_description: str,
+) -> str:
+    """Generate a plain-text cover letter for the candidate."""
+    client = _get_client()
+    prompt = f"""{profile_context}
+
+---
+
+Job title: {job_title or "Unknown Role"}
+Company: {company or "the company"}
+Job description:
+{job_description[:3000]}
+
+---
+
+Write a professional cover letter for this job application.
+Requirements:
+- 3-4 short paragraphs, under 350 words total
+- Opening: express genuine interest in the specific role and company
+- Middle: highlight 2-3 relevant experiences or skills from the resume that match the job
+- Closing: invite them to review the resume and express availability for an interview
+- Address to "Hiring Manager"
+- Sign with the candidate's full name
+- Plain text only, no markdown, no bullet points
+"""
+    response = client.models.generate_content(
+        model=config.GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=(
+                "You are a professional career coach writing a concise, genuine cover letter "
+                "for a job applicant. Write in first person, plain text, no markdown."
+            ),
+            temperature=0.4,
+        ),
+    )
+    return _sanitize((response.text or "").strip())
 
 
 def answer_fields_batch(
@@ -161,7 +226,7 @@ def _parse_batch_response(raw: str) -> dict[str, str]:
             elif v is None:
                 out[str(k)] = ""
             else:
-                out[str(k)] = str(v)
+                out[str(k)] = _sanitize(str(v))
     return out
 
 

@@ -24,20 +24,21 @@ def fetch_security_code(
     email_addr: str,
     app_password: str,
     started_at: datetime | None = None,
-    timeout_seconds: int = 120,
-    poll_interval: float = 5.0,
+    timeout_seconds: int = 90,
+    poll_interval: float = 2.0,
 ) -> str | None:
     """Poll Gmail for a fresh Greenhouse security-code email. Returns the code or None on timeout.
 
-    Only matches emails received at/after `started_at` (defaults to ~10s before call time)
+    Only matches emails received at/after `started_at` (defaults to ~30s before call time)
     so a stale code email from earlier in the day isn't picked up.
     """
-    started_at = started_at or (datetime.now(timezone.utc) - timedelta(seconds=10))
+    started_at = started_at or (datetime.now(timezone.utc) - timedelta(seconds=30))
     deadline = time.time() + timeout_seconds
     first_error: str | None = None
     attempts = 0
     while time.time() < deadline:
         attempts += 1
+        _console.print(f"[dim]Gmail poll attempt {attempts}...[/dim]")
         try:
             code = _try_fetch(email_addr, app_password, started_at)
             if code:
@@ -49,6 +50,7 @@ def fetch_security_code(
         except Exception as e:
             if first_error is None:
                 first_error = f"{type(e).__name__}: {e}"
+            _console.print(f"[dim]Gmail poll error: {type(e).__name__}: {e}[/dim]")
         time.sleep(poll_interval)
     if first_error:
         _console.print(f"[yellow]Gmail poll: every attempt failed. First error: {first_error}[/yellow]")
@@ -68,12 +70,21 @@ def _try_fetch(email_addr: str, app_password: str, started_at: datetime) -> str 
         if typ != "OK":
             M.select("INBOX", readonly=True)
         since_str = started_at.strftime("%d-%b-%Y")
-        # Search by subject only; filter by sender in Python so we tolerate the various
-        # greenhouse-mail.io / greenhouse.io domains they've sent from.
-        typ, data = M.search(None, f'(SUBJECT "{SUBJECT_HINT}" SINCE "{since_str}")')
-        if typ != "OK" or not data or not data[0]:
+        # Try progressively broader searches so we catch Greenhouse regardless of exact subject.
+        ids: list[bytes] = []
+        for search_term in [
+            f'(SUBJECT "security code" SINCE "{since_str}")',
+            f'(SUBJECT "verification code" SINCE "{since_str}")',
+            f'(SUBJECT "your code" SINCE "{since_str}")',
+            f'(FROM "greenhouse" SINCE "{since_str}")',
+        ]:
+            typ, data = M.search(None, search_term)
+            if typ == "OK" and data and data[0]:
+                ids = data[0].split()
+                _console.print(f"[dim]IMAP search '{search_term}' → {len(ids)} message(s)[/dim]")
+                break
+        if not ids:
             return None
-        ids = data[0].split()
         for msg_id in reversed(ids):
             typ, msg_data = M.fetch(msg_id, "(RFC822)")
             if typ != "OK":

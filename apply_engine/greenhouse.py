@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout, sync_playwright
+from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeout, sync_playwright
 
 from . import ai
 
@@ -447,7 +447,27 @@ def _try_follow_apply_link(page: Page) -> "Page | None":
         pass
 
     if page.url == prev_url:
-        return None  # No navigation occurred
+        # URL didn't change — the click likely injected a Greenhouse iframe or opened a modal.
+        # Give JS time to create the iframe / render the modal.
+        page.wait_for_timeout(2500)
+
+        # First priority: a Greenhouse iframe was injected — navigate directly into it.
+        gh_iframe_url = _find_greenhouse_iframe_url(page)
+        if gh_iframe_url:
+            page.goto(gh_iframe_url, wait_until="domcontentloaded")
+            return page
+
+        # Second: an inline/modal form appeared in the main DOM.
+        try:
+            page.wait_for_selector(
+                "#grnhse_app form, form#application_form, form#application-form, "
+                "form[action*='greenhouse.io'], input[name='first_name'], input[name='email']",
+                timeout=4000,
+            )
+            time.sleep(0.5)
+            return page
+        except PlaywrightTimeout:
+            return None
 
     # May have landed on a company page that still embeds Greenhouse via iframe
     if "greenhouse.io" not in page.url:
@@ -505,40 +525,300 @@ def open_application(page_factory, url: str) -> tuple[Page, list[Field], PageMet
 
     # If no application fields found, this is likely a job-description page.
     # Follow the "Apply" link/button to reach the actual application form.
-    if not combobox_fields and not standard_fields:
+    # Allow two hops: some sites link to a Greenhouse listing page, which itself
+    # requires a second "Apply for this job" click to reach the actual form.
+    for _hop in range(2):
+        if combobox_fields or standard_fields:
+            break
         form_page = _try_follow_apply_link(page)
-        if form_page is not None:
-            page = form_page
-            try:
-                page.wait_for_selector(
-                    "form input, form select, form textarea, form [role='combobox']",
-                    timeout=15000,
-                )
-            except PlaywrightTimeout:
-                pass
-            time.sleep(0.6)
-            _dismiss_overlays(page)
-            combobox_fields = _extract_comboboxes(page)
-            standard = page.evaluate(EXTRACT_JS)
-            standard_fields = [Field.from_dict(d) for d in standard]
+        if form_page is None:
+            break
+        page = form_page
+        try:
+            page.wait_for_selector(
+                "form input, form select, form textarea, form [role='combobox']",
+                timeout=15000,
+            )
+        except PlaywrightTimeout:
+            pass
+        time.sleep(0.6)
+        _dismiss_overlays(page)
+        combobox_fields = _extract_comboboxes(page)
+        standard = page.evaluate(EXTRACT_JS)
+        standard_fields = [Field.from_dict(d) for d in standard]
 
-    return page, combobox_fields + standard_fields, _extract_meta(page)
+    all_fields = combobox_fields + standard_fields
+    # If no location field was detected (async rendering race), try a direct fallback.
+    if not any(_is_location_field(f) for f in all_fields):
+        loc_fallback = _greenhouse_location_fallback(page)
+        if loc_fallback:
+            all_fields.append(loc_fallback)
+    # Detect custom select widgets (e.g. Duolingo EEO dropdowns) missed by standard extractors.
+    # Pass existing labels so any mis-identified trigger near a standard field is skipped.
+    existing_labels = {f.label.strip().lower() for f in all_fields}
+    all_fields += _extract_custom_selects(page, existing_labels=existing_labels)
+    return page, all_fields, _extract_meta(page)
+
+
+_CUSTOM_SELECT_JS = r"""
+() => {
+  const out = [];
+  let idx = 0;
+  const already = el => el.getAttribute('data-ae-key') || el.getAttribute('data-ae-skip');
+  const clean = s => (s || '').replace(/\s+/g, ' ').replace(/\*+$/, '').replace(/\(required\)$/i, '').trim();
+  const stripSelect = s => s.replace(/\s*Select\.{0,3}\s*$/i, '').replace(/\*+$/, '').trim();
+  const isVis = el => {
+    if (!el) return false;
+    if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden';
+  };
+  const isSelectTrigger = el =>
+    /^Select(\.\.\.|)$/.test(clean(el.textContent)) &&
+    !el.closest('[role="listbox"]') &&
+    !el.closest('select') &&
+    isVis(el) && !already(el);
+
+  // Search within the broadest application container available.
+  const root = document.querySelector('#grnhse_app, form#application_form, form') || document.body;
+
+  // Strategy 0 (preferred): Greenhouse "ingestion form" structure. Each question lives inside
+  // <DIV id="question_<id>" role="group"> with a sibling <LABEL id="question_<id>--label">.
+  // Custom dropdowns wrap the actual trigger as <BUTTON aria-haspopup="listbox" aria-controls="...">.
+  // Targeting the BUTTON instead of the display SPAN means click() actually opens the dropdown.
+  const groups = root.querySelectorAll('[id^="question_"][role="group"]');
+  for (const grp of groups) {
+    if (already(grp)) continue;
+    const btn = grp.querySelector('button[aria-haspopup="listbox"]');
+    if (!btn || already(btn) || !isVis(btn)) continue;
+    // Skip if the standard extractor already tagged a sibling input/select inside this group.
+    if (grp.querySelector('[data-ae-key]:not(button[aria-haspopup="listbox"])')) continue;
+
+    // Label: prefer the matching LABEL element by id convention, then aria-labelledby, then
+    // any LABEL/legend inside the group.
+    let label = null;
+    const lbl = document.getElementById(grp.id + '--label');
+    if (lbl) label = clean(lbl.textContent);
+    if (!label) {
+      const lblBy = btn.getAttribute('aria-labelledby') || grp.getAttribute('aria-labelledby');
+      if (lblBy) {
+        const e = document.getElementById(lblBy);
+        if (e) label = clean(e.textContent);
+      }
+    }
+    if (!label) {
+      const inner = grp.querySelector('label, legend');
+      if (inner) label = clean(inner.textContent);
+    }
+    if (!label) continue;  // unlabelled — skip rather than guess
+
+    const key = `ae_custom_${idx++}`;
+    btn.setAttribute('data-ae-key', key);
+    btn.setAttribute('data-ae-combobox', '1');
+    // Mark the entire group + every "Select..." display element so Strategy 1/2 don't
+    // re-tag the same widget via an ancestor whose textContent collapses to "Select...".
+    grp.setAttribute('data-ae-skip', '1');
+    grp.querySelectorAll('span, div').forEach(s => {
+      if (s === btn) return;
+      const t = clean(s.textContent);
+      if (/^Select(\.\.\.|)$/.test(t)) s.setAttribute('data-ae-skip', '1');
+    });
+    out.push({ key, label });
+  }
+
+  // Find trigger label by walking ancestors, scanning siblings before the trigger branch.
+  const findLabel = (trigger) => {
+    let ancestor = trigger.parentElement;
+    for (let i = 0; i < 8 && ancestor; i++) {
+      for (const child of ancestor.children) {
+        if (child === trigger || child.contains(trigger)) break;
+        const raw = clean(child.textContent);
+        const txt = stripSelect(raw);
+        if (txt && !/please select/i.test(txt) && txt.length > 3 && txt.length < 300) return txt;
+      }
+      ancestor = ancestor.parentElement;
+    }
+    return null;
+  };
+
+  // Strategy 1: "Please select the one that applies to you" proximity search.
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const seenLbl = new Set();
+  while (walker.nextNode()) {
+    const t = clean(walker.currentNode.textContent);
+    if (!/please select.*applies to you/i.test(t)) continue;
+    const lbl = walker.currentNode.parentElement;
+    if (!lbl || seenLbl.has(lbl) || already(lbl)) continue;
+    seenLbl.add(lbl);
+
+    let trigger = null, question = null, scope = lbl;
+    for (let depth = 0; depth < 6 && scope && !trigger; depth++) {
+      const container = scope.parentElement;
+      if (!container) break;
+
+      // Question text: scan siblings BEFORE scope (in both directions)
+      if (!question) {
+        for (let el = scope.previousElementSibling; el; el = el.previousElementSibling) {
+          const txt = stripSelect(clean(el.textContent));
+          if (txt && !/please select/i.test(txt) && txt.length > 3 && txt.length < 300) { question = txt; break; }
+        }
+      }
+
+      // Trigger: scan siblings AFTER scope
+      for (let el = scope.nextElementSibling; el && !trigger; el = el.nextElementSibling) {
+        const cands = [el, ...Array.from(el.querySelectorAll('*'))].filter(isSelectTrigger);
+        if (cands.length) trigger = cands[cands.length - 1];
+      }
+      // Also scan inside siblings BEFORE scope (trigger may be inside the question container)
+      if (!trigger) {
+        for (let el = scope.previousElementSibling; el && !trigger; el = el.previousElementSibling) {
+          const cands = Array.from(el.querySelectorAll('*')).filter(isSelectTrigger);
+          if (cands.length) trigger = cands[cands.length - 1];
+        }
+      }
+
+      scope = container;
+    }
+    if (!trigger || already(trigger)) continue;
+    if (!question) question = findLabel(trigger);
+
+    const key = `ae_custom_${idx++}`;
+    trigger.setAttribute('data-ae-key', key);
+    trigger.setAttribute('data-ae-combobox', '1');
+    out.push({ key, label: question || 'Please select the one that applies to you' });
+  }
+
+  // Strategy 2: catch remaining untagged "Select..." triggers anywhere in the form.
+  // Handles EEO dropdowns whose labels don't use "please select" phrasing.
+  const allEls = Array.from(root.querySelectorAll('button, div[class], span[class], li'));
+  for (const el of allEls) {
+    if (!isSelectTrigger(el)) continue;
+    // Only keep leaves: element should have no child elements that are also triggers
+    if (Array.from(el.querySelectorAll('*')).some(isSelectTrigger)) continue;
+    const question = findLabel(el);
+    if (!question) continue;  // skip unlabelled triggers (likely irrelevant UI widgets)
+    const key = `ae_custom_${idx++}`;
+    el.setAttribute('data-ae-key', key);
+    el.setAttribute('data-ae-combobox', '1');
+    out.push({ key, label: question });
+  }
+
+  return out;
+}
+"""
+
+
+def _extract_custom_selects(page: Page, existing_labels: set[str] | None = None) -> list[Field]:
+    """Detect custom non-native select widgets (e.g. Duolingo EEO dropdowns) in the form.
+
+    existing_labels: lowercase label strings already handled by standard extractors.
+    Any trigger whose detected label matches one of these is skipped *before* the
+    discovery click, preventing spurious scroll/click cycles on mis-identified elements.
+    """
+    raw = page.evaluate(_CUSTOM_SELECT_JS)
+    fields: list[Field] = []
+    if not raw:
+        return fields
+
+    # Save scroll position so the page doesn't end up parked wherever the last trigger lived
+    # — minimises perceived "scrolling up and down" churn for the user.
+    try:
+        scroll_y = page.evaluate("() => window.scrollY")
+    except Exception:
+        scroll_y = None
+
+    for item in raw:
+        key = item["key"]
+        label = item.get("label") or "Please select the one that applies to you"
+
+        # Skip before clicking if this label belongs to an already-handled field.
+        # This prevents false positives (e.g. a "Select..." trigger near "First Name"
+        # being misidentified as a custom dropdown) from causing unnecessary scroll/click.
+        if existing_labels and label.strip().lower() in existing_labels:
+            try:
+                page.evaluate(
+                    "key => { const e = document.querySelector(`[data-ae-key=\"${key}\"]`);"
+                    " if (e) { e.removeAttribute('data-ae-key'); e.removeAttribute('data-ae-combobox'); } }",
+                    key,
+                )
+            except Exception:
+                pass
+            continue
+
+        sel = f'[data-ae-key="{key}"]'
+        options: list[str] = []
+        try:
+            # Short timeout: a misidentified trigger should fail fast, not block for 30s.
+            loc = page.locator(sel).first
+            loc.click(timeout=4000)
+            page.wait_for_timeout(350)
+            options = page.evaluate(_READ_DROPDOWN_OPTIONS_JS)
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(150)
+        except Exception:
+            options = []
+            # Best-effort dismiss in case the dropdown is half-open.
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+        if not options:
+            # Un-tag so a later conditional pass can re-check once dependent fields are filled.
+            try:
+                page.locator(sel).first.evaluate(
+                    "el => { el.removeAttribute('data-ae-key'); el.removeAttribute('data-ae-combobox'); }"
+                )
+            except Exception:
+                pass
+            continue
+
+        searchable = len(options) > SEARCHABLE_THRESHOLD
+        fields.append(Field(
+            key=key,
+            type="searchable_select" if searchable else "select",
+            label=label,
+            name=None,
+            required=True,
+            options=None if searchable else options,
+            max_length=None,
+        ))
+
+    if scroll_y is not None:
+        try:
+            page.evaluate("y => window.scrollTo(0, y)", scroll_y)
+        except Exception:
+            pass
+
+    return fields
 
 
 def _extract_comboboxes(page: Page) -> list[Field]:
     raw = page.evaluate(COMBOBOX_TAG_JS)
     fields: list[Field] = []
+    if not raw:
+        return fields
+
+    try:
+        scroll_y = page.evaluate("() => window.scrollY")
+    except Exception:
+        scroll_y = None
+
     for box in raw:
         sel = f'[data-ae-key="{box["key"]}"]'
         options: list[str] = []
         try:
-            page.locator(sel).first.click()
+            page.locator(sel).first.click(timeout=4000)
             page.wait_for_timeout(250)
             options = _read_visible_options(page)
             page.keyboard.press("Escape")
             page.wait_for_timeout(150)
         except Exception:
             options = []
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
 
         # Trim duplicates while preserving order
         seen = set()
@@ -562,6 +842,13 @@ def _extract_comboboxes(page: Page) -> list[Field]:
                 max_length=None,
             )
         )
+
+    if scroll_y is not None:
+        try:
+            page.evaluate("y => window.scrollTo(0, y)", scroll_y)
+        except Exception:
+            pass
+
     return fields
 
 
@@ -619,12 +906,122 @@ def _extract_meta(page: Page) -> PageMeta:
     return PageMeta(title=title, company=company, location=location)
 
 
-def fill_field(page: Page, field: Field, value: str, resume_path: Path | None = None) -> str | None:
+def _is_truthy(value: str) -> bool:
+    return value.strip().lower() in {"yes", "true", "1", "on"}
+
+
+def _force_check(page: Page, loc: Locator, checked: bool) -> None:
+    """Check or uncheck a checkbox/radio with progressively more forceful strategies,
+    verifying the DOM state after each attempt before trying the next."""
+
+    def _ok() -> bool:
+        try:
+            return loc.is_checked() == checked
+        except Exception:
+            return False
+
+    try:
+        if checked:
+            loc.check(timeout=5000)
+        else:
+            loc.uncheck(timeout=5000)
+        if _ok():
+            return
+    except Exception:
+        pass
+
+    _dismiss_overlays(page)
+    page.wait_for_timeout(200)
+
+    # Keyboard Space bypasses pointer-events CSS — guard prevents toggling away from desired state
+    try:
+        loc.scroll_into_view_if_needed()
+        loc.focus()
+        if not _ok():
+            loc.press("Space")
+        if _ok():
+            return
+    except Exception:
+        pass
+
+    # CDP force-click bypasses actionability checks
+    try:
+        loc.click(force=True, timeout=3000)
+        if _ok():
+            return
+    except Exception:
+        pass
+
+    # Clicking the <label> can reach elements the input itself can't
+    try:
+        input_id = loc.get_attribute("id")
+        if input_id:
+            label = page.locator(f'label[for="{input_id}"]')
+            if label.count() > 0:
+                label.first.click(force=True, timeout=3000)
+                if _ok():
+                    return
+    except Exception:
+        pass
+
+    # Native prototype setter bypasses React's instance-property override so the
+    # change event triggers React's synthetic event pipeline via document delegation.
+    checked_js = "true" if checked else "false"
+    loc.evaluate(
+        f"el => {{"
+        f"const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked').set;"
+        f"s.call(el, {checked_js});"
+        f"el.dispatchEvent(new MouseEvent('click', {{bubbles: true, cancelable: true}}));"
+        f"el.dispatchEvent(new Event('input', {{bubbles: true}}));"
+        f"el.dispatchEvent(new Event('change', {{bubbles: true}}));"
+        f"}}"
+    )
+
+
+_EXTRACT_JOB_DESC_JS = r"""
+() => {
+  const selectors = [
+    '.job-description', '#job-description', '[class*="job-description"]',
+    '[class*="jobDescription"]', '[id*="job-description"]',
+    '#content', '.content', 'article', 'main section',
+  ];
+  for (const sel of selectors) {
+    const el = document.querySelector(sel);
+    if (el) {
+      const txt = (el.innerText || '').replace(/\s+/g, ' ').trim();
+      if (txt.length > 100) return txt.slice(0, 5000);
+    }
+  }
+  return ((document.body.innerText || '').replace(/\s+/g, ' ').trim()).slice(0, 5000);
+}
+"""
+
+
+def extract_job_description(page: Page) -> str:
+    """Extract the job description text from the current page."""
+    try:
+        return page.evaluate(_EXTRACT_JOB_DESC_JS) or ""
+    except Exception:
+        return ""
+
+
+def _is_cover_letter_field(field: "Field") -> bool:
+    return bool(re.search(r"cover.?letter", field.label, re.I))
+
+
+def fill_field(page: Page, field: Field, value: str, resume_path: Path | None = None, cover_letter_path: Path | None = None) -> str | None:
     selector = f'[data-ae-key="{field.key}"]'
 
     if field.type == "file":
-        if resume_path and re.search(r"resume|cv\b|curriculum", field.label, re.I):
+        # "File upload" is the fallback label assigned when label extraction fails.
+        # Treat it as a resume slot if resume not yet placed (caller sets resume_path=None after first upload).
+        _is_resume_label = bool(re.search(r"resume|cv\b|curriculum", field.label, re.I))
+        _is_generic_label = field.label.strip().lower() == "file upload"
+        if resume_path and (_is_resume_label or _is_generic_label):
             page.locator(selector).first.set_input_files(str(resume_path))
+            return "uploaded"
+        if cover_letter_path and _is_cover_letter_field(field):
+            page.locator(selector).first.set_input_files(str(cover_letter_path))
             return "uploaded"
         return "skipped"
 
@@ -663,6 +1060,16 @@ def fill_field(page: Page, field: Field, value: str, resume_path: Path | None = 
         return
 
     if field.type == "searchable_select":
+        if _is_location_field(field) and value:
+            loc = page.locator(selector).first
+            try:
+                loc.click(timeout=5000)
+            except Exception:
+                _dismiss_overlays(page)
+                loc.click(force=True)
+            loc.fill("")
+            _fill_location(page, loc, value)
+            return
         _type_and_pick(page, selector, value)
         return
 
@@ -685,9 +1092,9 @@ def fill_field(page: Page, field: Field, value: str, resume_path: Path | None = 
             opt = box.get_attribute("data-ae-checkbox-value") or ""
             should_check = any(opt.strip() == v.strip() for v in values)
             if should_check and not box.is_checked():
-                box.check()
+                _force_check(page, box, True)
             elif not should_check and box.is_checked():
-                box.uncheck()
+                _force_check(page, box, False)
         return
 
     if field.type == "radio":
@@ -700,16 +1107,16 @@ def fill_field(page: Page, field: Field, value: str, resume_path: Path | None = 
                 if opt.strip().lower() == value.strip().lower():
                     target = r
                     break
-        target.first.check()
+        _force_check(page, target.first, True)
         return
 
     if field.type == "checkbox":
         loc = page.locator(selector).first
-        truthy = value.strip().lower() in {"yes", "true", "1", "on"}
+        truthy = _is_truthy(value)
         if truthy and not loc.is_checked():
-            loc.check()
+            _force_check(page, loc, True)
         elif not truthy and loc.is_checked():
-            loc.uncheck()
+            _force_check(page, loc, False)
         return
 
     raise ValueError(f"Unhandled field type: {field.type}")
@@ -744,39 +1151,124 @@ def _read_visible_options(page: Page) -> list[str]:
     return out
 
 
-def _click_visible_option(page: Page, value: str) -> bool:
-    """Click an option matching value within a visible listbox. Returns True if clicked.
+# Tags the best-matching visible dropdown option with data-ae-click-target="1" so
+# Playwright can click it (dispatching proper synthetic events React handles).
+# Tries strategies in priority order: ARIA listbox → ARIA roles → li[tabindex≥0] →
+# absolutely-positioned containers (portals) → any visible ul>li list.
+_TAG_OPTION_JS = r"""
+(target) => {
+    const norm = s => (s||'').replace(/\s+/g,' ').trim().toLowerCase();
+    const isVis = el => {
+        if (!el) return false;
+        const cs = getComputedStyle(el);
+        if (cs.display==='none'||cs.visibility==='hidden') return false;
+        return el.offsetParent!==null || cs.position==='fixed';
+    };
+    const t = norm(target);
+    const rank = el => {
+        const et=norm(el.textContent);
+        return et===t ? 3 : et.startsWith(t) ? 2 : et.includes(t) ? 1 : 0;
+    };
+    const best = els => els.map(el=>[el,rank(el)]).filter(([,r])=>r>0).sort((a,b)=>b[1]-a[1])[0]?.[0]||null;
+    const tag = el => {
+        document.querySelectorAll('[data-ae-click-target]').forEach(e=>e.removeAttribute('data-ae-click-target'));
+        el.setAttribute('data-ae-click-target','1');
+        return true;
+    };
+    // S1: ARIA listbox → option
+    for (const lb of [...document.querySelectorAll('[role="listbox"]')].filter(isVis)) {
+        const m=best([...lb.querySelectorAll('[role="option"]')].filter(isVis));
+        if(m) return tag(m);
+    }
+    // S2: Any ARIA option/menu role
+    const m2=best([...document.querySelectorAll('[role="option"],[role="menuitem"],[role="menuitemradio"]')].filter(isVis));
+    if(m2) return tag(m2);
+    // S3: li with non-negative tabindex (react-select, downshift, slim-select)
+    const m3=best([...document.querySelectorAll('li[tabindex]')].filter(el=>isVis(el)&&el.tabIndex>=0));
+    if(m3) return tag(m3);
+    // S4: Absolutely/fixed-positioned containers — dropdown portals, custom widgets
+    const dropsels='ul,ol,[class*="dropdown"],[class*="select__"],[class*="menu__"],[class*="-options"],[class*="-list"]';
+    for (const c of [...document.querySelectorAll(dropsels)].filter(el=>{
+        if(!isVis(el)) return false;
+        const p=getComputedStyle(el).position;
+        return p==='absolute'||p==='fixed';
+    })){
+        const items=[...c.querySelectorAll('div,li,span')].filter(
+            el=>isVis(el)&&el.childElementCount===0&&norm(el.textContent).length>0&&norm(el.textContent).length<200
+        );
+        const m=best(items);
+        if(m) return tag(m);
+    }
+    // S5: Any visible ul with ≥2 direct li children (catches plain custom dropdowns)
+    for (const ul of [...document.querySelectorAll('ul')].filter(isVis)){
+        const items=[...ul.querySelectorAll(':scope>li')].filter(isVis);
+        if(items.length>=2){const m=best(items);if(m) return tag(m);}
+    }
+    return false;
+}
+"""
 
-    Match priority: exact -> startsWith -> word-boundary -> substring. The naive
-    `includes` fallback alone matches 'British Indian Ocean Territory' for 'India',
-    so we always prefer a word-boundary match before falling back to substring.
+# Read all visible dropdown option texts — comprehensive version used for custom EEO selects.
+# Falls through strategies until options are found, same priority order as _TAG_OPTION_JS.
+_READ_DROPDOWN_OPTIONS_JS = r"""
+() => {
+    const isVis = el => el.offsetParent!==null && getComputedStyle(el).display!=='none';
+    const clean = s => (s||'').replace(/\s+/g,' ').trim();
+    const add = (items,out) => items.filter(isVis).forEach(o=>{const t=clean(o.textContent);if(t&&t.length<200) out.add(t);});
+    const out=new Set();
+    [...document.querySelectorAll('[role="listbox"]')].filter(isVis).forEach(lb=>add([...lb.querySelectorAll('[role="option"]')],out));
+    if(out.size) return [...out];
+    add([...document.querySelectorAll('[role="option"],[role="menuitem"],[role="menuitemradio"]')],out);
+    if(out.size) return [...out];
+    add([...document.querySelectorAll('li[tabindex]')].filter(el=>el.tabIndex>=0),out);
+    if(out.size) return [...out];
+    const dropsels='ul,ol,[class*="dropdown"],[class*="select__"],[class*="menu__"],[class*="-options"],[class*="-list"]';
+    for (const c of [...document.querySelectorAll(dropsels)].filter(el=>{
+        if(!isVis(el)) return false;
+        const p=getComputedStyle(el).position;
+        return p==='absolute'||p==='fixed';
+    })){
+        add([...c.querySelectorAll('div,li,span')].filter(el=>el.childElementCount===0),out);
+        if(out.size) return [...out];
+    }
+    for (const ul of [...document.querySelectorAll('ul')].filter(isVis)){
+        const items=[...ul.querySelectorAll(':scope>li')].filter(isVis);
+        if(items.length>=2){ add(items,out); if(out.size) return [...out]; }
+    }
+    return [...out];
+}
+"""
+
+
+def _click_visible_option(page: Page, value: str) -> bool:
+    """Tag the best-matching visible dropdown option and click it via Playwright.
+
+    Uses _TAG_OPTION_JS to find the option across any dropdown structure (ARIA listbox,
+    custom portals, plain ul/li) and tags it with data-ae-click-target. Playwright then
+    clicks the tagged element, dispatching proper synthetic events that React handles.
     """
-    target_lower = value.strip().lower()
-    return page.evaluate(
-        r"""(target) => {
-            const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-            const escaped = target.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
-            const wordRe = new RegExp('\\b' + escaped + '\\b', 'i');
-            const visible = Array.from(document.querySelectorAll('[role="listbox"]'))
-                .filter(lb => lb.offsetParent !== null);
-            for (const lb of visible) {
-                const opts = Array.from(lb.querySelectorAll('[role="option"]'));
-                if (!opts.length) continue;
-                let match = opts.find(o => norm(o.textContent) === target);
-                if (!match) match = opts.find(o => norm(o.textContent).startsWith(target));
-                if (!match) match = opts.find(o => wordRe.test(norm(o.textContent)));
-                if (!match) match = opts.find(o => norm(o.textContent).includes(target));
-                if (match) { match.click(); return true; }
-            }
-            return false;
-        }""",
-        target_lower,
-    )
+    tagged = page.evaluate(_TAG_OPTION_JS, value.strip().lower())
+    if not tagged:
+        return False
+    tgt = page.locator('[data-ae-click-target="1"]')
+    try:
+        if tgt.count() > 0:
+            tgt.first.scroll_into_view_if_needed()
+            tgt.first.click(timeout=2000)
+            return True
+    except Exception:
+        pass
+    finally:
+        try:
+            page.evaluate("() => document.querySelectorAll('[data-ae-click-target]').forEach(e=>e.removeAttribute('data-ae-click-target'))")
+        except Exception:
+            pass
+    return False
 
 
 def _pick_combobox_option(page: Page, selector: str, value: str) -> None:
     page.locator(selector).first.click()
-    page.wait_for_timeout(250)
+    page.wait_for_timeout(500)  # allow dropdown animation / React state settle
     if not _click_visible_option(page, value):
         if not _click_visible_option(page, "Other"):
             page.keyboard.press("Escape")
@@ -810,6 +1302,87 @@ def _type_and_pick(page: Page, selector: str, value: str) -> None:
 
 def _is_location_field(field: "Field") -> bool:
     return bool(re.search(r"\b(location|city|town)\b", field.label, re.I))
+
+
+def _greenhouse_location_fallback(page: Page) -> "Field | None":
+    """Detect Greenhouse's location input when standard extractors miss it.
+
+    Handles two patterns:
+    - Classic: input[name="job_application[location]"] (text type)
+    - Modern:  input[type="search"][aria-haspopup="listbox"] near a location label
+    """
+    result = page.evaluate(r"""() => {
+        const already = (el) => el.getAttribute('data-ae-key') || el.getAttribute('data-ae-skip');
+        const clean = (el) => (el.textContent || '').replace(/\s+/g, ' ')
+            .replace(/\*+$/, '').replace(/\(required\)$/i, '').trim();
+        const locationRe = /\b(location|city|town)\b/i;
+
+        // Pattern 1: classic Greenhouse location input (text type, known name/id)
+        const classic = Array.from(document.querySelectorAll(
+            'input[name="job_application[location]"], '
+            + 'input[id="job_application_location"], '
+            + 'input[data-testid*="location" i], '
+            + 'input[placeholder*="city" i], '
+            + 'input[placeholder*="location" i]'
+        )).filter(el => !already(el) && el.type !== 'hidden');
+        for (const el of classic) {
+            const key = 'ae_gh_location';
+            el.setAttribute('data-ae-key', key);
+            let label = 'Location (city)';
+            if (el.id) {
+                try {
+                    const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+                    if (lbl) { const t = clean(lbl); if (t) label = t; }
+                } catch (e) {}
+            }
+            if (label === 'Location (city)') {
+                const aria = el.getAttribute('aria-label');
+                if (aria) label = aria.trim();
+            }
+            return { key, label, required: el.required, inputType: el.type };
+        }
+
+        // Pattern 2: visible search inputs near a location label (Duolingo-style combobox).
+        // The widget uses two sibling inputs: one hidden trigger (aria-haspopup) and one
+        // visible input (no aria-haspopup, tabindex≥0) that the user actually types into.
+        const searchInputs = Array.from(document.querySelectorAll('input[type="search"]'))
+            .filter(el =>
+                !already(el) &&
+                !el.getAttribute('aria-haspopup') &&
+                getComputedStyle(el).visibility === 'visible'
+            );
+        for (const el of searchInputs) {
+            let label = null;
+            let ancestor = el.parentElement;
+            for (let i = 0; i < 8; i++) {
+                if (!ancestor) break;
+                const lbl = ancestor.querySelector(':scope > label');
+                if (lbl) { label = clean(lbl); break; }
+                ancestor = ancestor.parentElement;
+            }
+            if (!label) {
+                const aria = el.getAttribute('aria-label') || '';
+                if (aria) label = aria.trim();
+            }
+            if (label && locationRe.test(label)) {
+                const key = 'ae_gh_location';
+                el.setAttribute('data-ae-key', key);
+                return { key, label, required: true, inputType: 'search' };
+            }
+        }
+        return null;
+    }""")
+    if not result:
+        return None
+    return Field(
+        key=result["key"],
+        type="text",
+        label=result.get("label") or "Location (city)",
+        name=None,
+        required=bool(result.get("required", True)),
+        options=None,
+        max_length=None,
+    )
 
 
 _AUTOCOMPLETE_PICK_JS = r"""
@@ -858,26 +1431,84 @@ _AUTOCOMPLETE_PICK_JS = r"""
 """
 
 
+_AUTOCOMPLETE_PICK_FIRST_JS = r"""
+() => {
+  const isVisible = (el) => {
+    if (!el || el.offsetParent === null) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
+  };
+  const selectors = [
+    '[role="listbox"] [role="option"]', '[role="option"]',
+    'ul[class*="suggest" i] li', 'ul[class*="autocomplete" i] li',
+    'ul[class*="location" i] li', '[class*="suggestions" i] li',
+    '[class*="dropdown" i] [class*="option" i]', '[class*="dropdown" i] [class*="item" i]',
+    '[class*="menu" i] [class*="item" i]', '.pac-container .pac-item',
+    '.geosuggest__item', '[id*="downshift" i] li',
+  ];
+  const candidates = Array.from(document.querySelectorAll(selectors.join(', ')))
+    .filter(isVisible)
+    .filter(el => (el.textContent || '').replace(/\s+/g, ' ').trim().length > 0);
+  if (!candidates.length) return null;
+  const pick = candidates[0];
+  pick.scrollIntoView({ block: 'center' });
+  pick.click();
+  return (pick.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+"""
+
+
 def _fill_location(page: Page, loc, value: str) -> bool:
-    """Type a location and commit a suggestion. Polls for the dropdown for up to ~3s
+    """Type a location and commit a suggestion. Polls the dropdown for up to ~4s
     because Greenhouse debounces the autocomplete request. Returns True if a suggestion
     was committed."""
-    loc.press_sequentially(value, delay=80)
-    deadline = time.time() + 3.0
-    picked: str | None = None
-    while time.time() < deadline:
+
+    def _try_type_and_pick(search: str) -> str | None:
+        loc.fill("")
+        loc.press_sequentially(search, delay=80)
+        deadline = time.time() + 3.5
+        while time.time() < deadline:
+            # Prefer Playwright's pointer-event click (React-compatible) over DOM .click().
+            # _click_visible_option uses _TAG_OPTION_JS which covers ARIA listboxes,
+            # custom portals, plain ul/li, and common autocomplete containers.
+            if _click_visible_option(page, value):
+                return value
+            # Fallback: broader selectors (geosuggest, ul.suggest, etc.)
+            try:
+                result = page.evaluate(_AUTOCOMPLETE_PICK_JS, value)
+            except Exception:
+                result = None
+            if result:
+                return result
+            page.wait_for_timeout(200)
+        # One extra second, then take the first available suggestion
+        page.wait_for_timeout(1000)
         try:
-            picked = page.evaluate(_AUTOCOMPLETE_PICK_JS, value)
+            first_text = page.evaluate(_AUTOCOMPLETE_PICK_FIRST_JS)
         except Exception:
-            picked = None
-        if picked:
-            break
-        page.wait_for_timeout(200)
+            first_text = None
+        if first_text:
+            # Try Playwright click on the matched text first; DOM click already fired above.
+            _click_visible_option(page, first_text)
+            return first_text
+        return None
+
+    # Pass 1: full city name
+    picked = _try_type_and_pick(value)
+
+    # Pass 2: shorter prefix (handles alternate spellings / slower APIs)
+    if not picked and len(value) >= 4:
+        picked = _try_type_and_pick(value[:4])
+
     if not picked:
+        # Clear — leaving unselected text causes form validation errors
+        loc.fill("")
         return False
     # Tab off so the React component locks in the selection before we move on.
     loc.press("Tab")
-    page.wait_for_timeout(150)
+    page.wait_for_timeout(300)
     return True
 
 
@@ -960,6 +1591,8 @@ def submit(page: Page) -> str:
         'button:has-text("Submit")'
     )
     # Walk candidates in DOM order and pick the first one that is actually visible.
+    if btn_loc.count() == 0:
+        raise ValueError("No submit button found on page")
     btn = btn_loc.first
     for i in range(min(btn_loc.count(), 10)):
         candidate = btn_loc.nth(i)
@@ -1111,6 +1744,19 @@ _FIND_FORM_ERRORS_JS = r"""
   return out;
 }
 """
+
+
+def extract_new_standard_fields(page: Page, existing_labels: set[str] | None = None) -> list[Field]:
+    """Re-extract standard fields that became visible since the last extraction pass.
+
+    EXTRACT_JS already skips elements tagged with data-ae-key, so this safely
+    returns only newly-visible native inputs/selects/textareas. Useful for catching
+    conditional fields that appear after earlier form answers are submitted."""
+    standard = page.evaluate(EXTRACT_JS)
+    new_fields = [Field.from_dict(d) for d in standard]
+    if existing_labels:
+        new_fields = [f for f in new_fields if f.label.strip().lower() not in existing_labels]
+    return new_fields
 
 
 def find_form_errors(page: Page) -> list[dict]:

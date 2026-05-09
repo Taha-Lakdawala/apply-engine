@@ -54,6 +54,8 @@ def apply_to_url(
 
         console.print(f"[bold]Found {len(fields)} fields[/bold] on {url}")
 
+        job_description = greenhouse.extract_job_description(page)
+
         # ---- Phase 1: deterministic resolution (preset / profile / stored) ----
         job_location = meta.location
         resolved: dict[str, resolver.ResolvedAnswer] = {}
@@ -93,17 +95,41 @@ def apply_to_url(
                         value="", source="ai", question_id=qid, answer_id=0,
                     )
 
+        # ---- Phase 2b: generate cover letter if any required file field needs one ----
+        cover_letter_path = None
+        for f in fields:
+            if f.type == "file" and f.required and greenhouse._is_cover_letter_field(f):
+                console.print("[bold]Generating cover letter (required field)...[/bold]")
+                cl_text = ai.generate_cover_letter(
+                    profile.as_context(), meta.title, meta.company, job_description
+                )
+                cover_letter_path = config.DATA_DIR / f"cover_letter_{int(time.time())}.pdf"
+                _write_cover_letter_pdf(cl_text, cover_letter_path)
+                console.print(f"  [cyan]cover_letter[/cyan] generated -> {cover_letter_path.name}")
+                break
+
         # ---- Phase 3: fill the form (slowed down to look human to reCAPTCHA) ----
+        resume_uploaded = False
         for f in fields:
             page.wait_for_timeout(random.randint(150, 450))
             try:
                 if f.type == "file":
-                    outcome = greenhouse.fill_field(page, f, "", resume_path=profile.resume_path)
+                    # Pass resume_path only until we've uploaded it once; subsequent generic
+                    # file fields (e.g. optional attachments) will be skipped automatically.
+                    resume_path_arg = profile.resume_path if not resume_uploaded else None
+                    outcome = greenhouse.fill_field(
+                        page, f, "", resume_path=resume_path_arg, cover_letter_path=cover_letter_path
+                    )
                     if outcome == "uploaded":
+                        if greenhouse._is_cover_letter_field(f) and cover_letter_path:
+                            uploaded_name = cover_letter_path.name
+                        else:
+                            uploaded_name = profile.resume_path.name
+                            resume_uploaded = True
                         report.fields_filled.append(
-                            FillResult(label=f.label, type=f.type, value=str(profile.resume_path), source="preset")
+                            FillResult(label=f.label, type=f.type, value=uploaded_name, source="preset")
                         )
-                        console.print(f"  [cyan]file[/cyan]    {f.label} -> {profile.resume_path.name}")
+                        console.print(f"  [cyan]file[/cyan]    {f.label} -> {uploaded_name}")
                     else:
                         report.fields_filled.append(
                             FillResult(label=f.label, type=f.type, value="", source="skipped",
@@ -113,7 +139,7 @@ def apply_to_url(
                     continue
 
                 ans = resolved[f.key]
-                greenhouse.fill_field(page, f, ans.value, resume_path=profile.resume_path)
+                greenhouse.fill_field(page, f, ans.value, resume_path=profile.resume_path, cover_letter_path=cover_letter_path)
                 report.fields_filled.append(
                     FillResult(label=f.label, type=f.type, value=ans.value, source=ans.source)
                 )
@@ -125,7 +151,127 @@ def apply_to_url(
                 )
                 console.print(f"  [red]skip[/red]    {f.label} ({e})")
 
-        if submit:
+        # Re-verify "yes" checkboxes — React re-renders can silently uncheck them
+        for f in fields:
+            if f.type != "checkbox":
+                continue
+            ans = resolved.get(f.key)
+            if ans is None or not greenhouse._is_truthy(ans.value):
+                continue
+            try:
+                greenhouse._force_check(page, page.locator(f'[data-ae-key="{f.key}"]').first, True)
+            except Exception:
+                pass
+
+        # Late discovery: EEO / custom select sections that load after field interaction.
+        # Run the custom-select extractor again now that the page has had time to fully render.
+        # Pass existing labels so already-handled fields (e.g. "First Name") aren't re-detected.
+        existing_labels = {f.label.strip().lower() for f in fields}
+        late_fields = greenhouse._extract_custom_selects(page, existing_labels=existing_labels)
+        if late_fields:
+            console.print(f"[bold]Found {len(late_fields)} late-loading field(s)...[/bold]")
+            late_unknowns: list[tuple[greenhouse.Field, int]] = []
+            for f in late_fields:
+                qid, ans = resolver.try_known_resolve(
+                    f.to_field_spec(), profile, source_url=url, job_location=job_location
+                )
+                if ans is not None:
+                    resolved[f.key] = ans
+                else:
+                    late_unknowns.append((f, qid))
+
+            if late_unknowns:
+                late_ai = ai.answer_fields_batch(
+                    [(f.key, f.to_field_spec()) for f, _ in late_unknowns],
+                    profile.as_context(), resolver.get_prior_qa(),
+                    job_location=job_location, job_url=url,
+                )
+                for f, qid in late_unknowns:
+                    value = late_ai.get(f.key, "")
+                    if value.strip():
+                        resolved[f.key] = resolver.store_ai_answer(qid, value, source_url=url)
+                    else:
+                        resolved[f.key] = resolver.ResolvedAnswer(
+                            value="", source="ai", question_id=qid, answer_id=0,
+                        )
+
+            for f in late_fields:
+                page.wait_for_timeout(random.randint(150, 300))
+                ans = resolved.get(f.key)
+                if not ans or not ans.value.strip():
+                    console.print(f"  [dim]custom[/dim]  {f.label} -> [dim]skipped (no answer)[/dim]")
+                    continue
+                try:
+                    greenhouse.fill_field(page, f, ans.value)
+                    tag = {"ai": "yellow", "stored": "green", "preset": "blue", "profile": "magenta"}.get(ans.source, "white")
+                    console.print(f"  [{tag}]{ans.source:7}[/{tag}] {f.label} -> {_truncate(ans.value)}")
+                except Exception as e:
+                    console.print(f"  [red]skip[/red]    {f.label} ({e})")
+
+        # Conditional-field pass: native selects/inputs AND custom select widgets that only
+        # appear after earlier answers are filled (e.g. work-auth follow-up dropdowns).
+        # Both EXTRACT_JS and _CUSTOM_SELECT_JS skip already-tagged elements, so re-running is safe.
+        all_seen_labels = {f.label.strip().lower() for f in fields}
+        all_seen_labels.update(f.label.strip().lower() for f in late_fields)
+        page.wait_for_timeout(800)
+        conditional_fields = greenhouse.extract_new_standard_fields(page, existing_labels=all_seen_labels)
+        conditional_fields += greenhouse._extract_custom_selects(page, existing_labels=all_seen_labels)
+        if conditional_fields:
+            console.print(f"[bold]Found {len(conditional_fields)} conditional field(s)...[/bold]")
+            cond_unknowns: list[tuple[greenhouse.Field, int]] = []
+            for f in conditional_fields:
+                if f.type == "file":
+                    continue
+                qid, ans = resolver.try_known_resolve(
+                    f.to_field_spec(), profile, source_url=url, job_location=job_location
+                )
+                if ans is not None:
+                    resolved[f.key] = ans
+                else:
+                    cond_unknowns.append((f, qid))
+
+            if cond_unknowns:
+                cond_ai = ai.answer_fields_batch(
+                    [(f.key, f.to_field_spec()) for f, _ in cond_unknowns],
+                    profile.as_context(), resolver.get_prior_qa(),
+                    job_location=job_location, job_url=url,
+                )
+                for f, qid in cond_unknowns:
+                    value = cond_ai.get(f.key, "")
+                    if value.strip():
+                        resolved[f.key] = resolver.store_ai_answer(qid, value, source_url=url)
+                    else:
+                        resolved[f.key] = resolver.ResolvedAnswer(
+                            value="", source="ai", question_id=qid, answer_id=0,
+                        )
+
+            for f in conditional_fields:
+                if f.type == "file":
+                    continue
+                page.wait_for_timeout(random.randint(150, 300))
+                ans = resolved.get(f.key)
+                if not ans or not ans.value.strip():
+                    console.print(f"  [dim]cond[/dim]    {f.label} -> [dim]skipped (no answer)[/dim]")
+                    continue
+                try:
+                    greenhouse.fill_field(page, f, ans.value)
+                    tag = {"ai": "yellow", "stored": "green", "preset": "blue", "profile": "magenta"}.get(ans.source, "white")
+                    console.print(f"  [{tag}]{ans.source:7}[/{tag}] {f.label} -> {_truncate(ans.value)}")
+                except Exception as e:
+                    console.print(f"  [red]skip[/red]    {f.label} ({e})")
+
+        if submit and not fields:
+            console.print("\n[red]No application fields detected — cannot submit.[/red]")
+            report.error = "no application fields detected"
+        elif submit:
+            # Pre-submit screenshot: helps diagnose unfilled fields or validation state
+            pre_shot = config.DATA_DIR / f"pre_submit_{int(time.time())}.png"
+            try:
+                page.screenshot(path=str(pre_shot), full_page=True)
+                console.print(f"[dim]Pre-submit screenshot: {pre_shot}[/dim]")
+            except Exception:
+                pass
+
             console.print("\n[bold]Submitting application...[/bold]")
             page.wait_for_timeout(800)
             status = greenhouse.submit(page)
@@ -133,7 +279,7 @@ def apply_to_url(
             if status == "code_required":
                 sec_selector = greenhouse.find_security_code_field(page, wait_ms=3000)
                 if sec_selector:
-                    submit_started_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+                    submit_started_at = datetime.now(timezone.utc) - timedelta(seconds=30)
                     code = _wait_for_security_code(profile, submit_started_at)
                     if code:
                         # Type (don't fill) so React's onChange fires per keystroke and the
@@ -178,6 +324,15 @@ def apply_to_url(
             try:
                 page.screenshot(path=str(shot_path), full_page=True)
                 console.print(f"[dim]Post-submit screenshot: {shot_path}[/dim]")
+            except Exception:
+                pass
+
+            # Log URL + first 300 chars of visible text to help debug unknown states
+            try:
+                _dbg_url = page.url
+                _dbg_txt = (page.evaluate("() => document.body.innerText") or "")[:300].replace("\n", " ")
+                console.print(f"[dim]Post-submit URL: {_dbg_url}[/dim]")
+                console.print(f"[dim]Post-submit text: {_dbg_txt}[/dim]")
             except Exception:
                 pass
 
@@ -276,7 +431,7 @@ def _wait_for_security_code(
     if gmail_addr and app_password and gmail_addr.endswith("@gmail.com"):
         console.print(f"[dim]Polling Gmail ({gmail_addr}) for the code...[/dim]")
         code = email_fetcher.fetch_security_code(
-            gmail_addr, app_password, started_at=started_at, timeout_seconds=300
+            gmail_addr, app_password, started_at=started_at, timeout_seconds=90
         )
         if code:
             console.print(f"[green]Pulled code from Gmail: {_redact(code)}[/green]")
@@ -325,3 +480,24 @@ def _redact(code: str) -> str:
 def _truncate(s: str, n: int = 70) -> str:
     s = s.replace("\n", " ")
     return s if len(s) <= n else s[:n] + "…"
+
+
+
+def _write_cover_letter_pdf(text: str, path: "Path") -> None:
+    from fpdf import FPDF
+
+    pdf = FPDF(format="A4")
+    pdf.set_margins(left=25, top=25, right=25)
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.set_font("Helvetica", size=11)
+
+    for paragraph in text.split("\n"):
+        stripped = paragraph.strip()
+        if not stripped:
+            pdf.ln(4)
+        else:
+            pdf.multi_cell(0, 6, stripped)
+            pdf.ln(1)
+
+    pdf.output(str(path))
