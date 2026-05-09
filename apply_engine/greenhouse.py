@@ -366,10 +366,12 @@ _DISMISS_OVERLAYS_JS = r"""
 
 
 def _dismiss_overlays(page: Page) -> None:
-    """Best-effort removal of cookie/consent/sticky banners that block form interaction."""
+    """Best-effort removal of cookie/consent/sticky banners that block form interaction.
+
+    The JS is synchronous DOM mutation (button clicks + pointer-events:none) so no
+    settle wait is needed — return immediately to keep the startup path snappy."""
     try:
         page.evaluate(_DISMISS_OVERLAYS_JS)
-        page.wait_for_timeout(300)
     except Exception:
         pass
 
@@ -486,13 +488,19 @@ def open_application(page_factory, url: str) -> tuple[Page, list[Field], PageMet
     page = page_factory()
     page.goto(url, wait_until="domcontentloaded")
 
-    # If the host page is not itself a Greenhouse domain, wait for all JS to settle
-    # (networkidle) — Greenhouse JS embeds inject the form only after fetching the job
-    # definition, so they appear well after DOMContentLoaded. networkidle is the right
-    # signal rather than a fixed timeout.
+    # If the host page is not itself a Greenhouse domain, race for the first useful
+    # signal: either a Greenhouse iframe appears (embed pattern) or the application
+    # form renders inline. Returning on the first hit avoids the multi-second tail of
+    # `networkidle` on bloated job-board hosts (analytics, chat widgets, websockets
+    # often keep the network busy long after the form is interactive).
     if "greenhouse.io" not in page.url:
         try:
-            page.wait_for_load_state("networkidle", timeout=12000)
+            page.wait_for_selector(
+                'iframe[src*="greenhouse.io"], '
+                "form#application_form, #grnhse_app form, "
+                "input[name='first_name'], input[name='email']",
+                timeout=5000,
+            )
         except PlaywrightTimeout:
             pass
         gh_iframe_url = _find_greenhouse_iframe_url(page)
@@ -516,7 +524,6 @@ def open_application(page_factory, url: str) -> tuple[Page, list[Field], PageMet
             )
         except PlaywrightTimeout:
             pass
-    time.sleep(0.3)
     _dismiss_overlays(page)
 
     combobox_fields = _extract_comboboxes(page)

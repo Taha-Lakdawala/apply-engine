@@ -133,7 +133,7 @@ Defensive: closes/neutralises common cookie/consent/sticky banners that intercep
 
 Also catches any `[role="dialog"][aria-modal="true"]` that's `position: fixed|sticky` and not inside a `<form>`.
 
-Wrapped in Python by `_dismiss_overlays(page)` which evaluates the JS and waits 300ms.
+Wrapped in Python by `_dismiss_overlays(page)` which evaluates the JS and returns immediately — the JS is synchronous DOM mutation (button clicks + `pointer-events: none`), so no settle wait is needed.
 
 ### `_CUSTOM_SELECT_JS`
 
@@ -189,9 +189,9 @@ These are common reCAPTCHA fingerprinting checkpoints.
 The high-level entry point used by `runner.py`. Flow:
 
 1. `page = page_factory(); page.goto(url, wait_until="domcontentloaded")`.
-2. **Embed handling:** if the host page is not a `greenhouse.io` URL, `wait_for_load_state("networkidle", timeout=12000)` first (Greenhouse JS embeds inject the form after fetching the job definition). Then check for an iframe via `_find_greenhouse_iframe_url`; if found, `page.goto(iframe_url)`.
+2. **Embed handling:** if the host page is not a `greenhouse.io` URL, race `wait_for_selector` for the first useful signal — either an `iframe[src*="greenhouse.io"]` (embed pattern) or the application form selectors (inline render) — with a 5s cap. Returning on the first hit avoids the multi-second tail of `networkidle` on bloated job-board hosts. Then check for an iframe via `_find_greenhouse_iframe_url`; if found, `page.goto(iframe_url)`.
 3. **Wait for form:** wait for Greenhouse-specific selectors (`form#application_form`, `#grnhse_app form`, `input[name='first_name']`, `input[name='email']`) up to 12s. Fall back to any `form input/select/textarea/[role='combobox']` for 5s.
-4. `time.sleep(0.3)` and `_dismiss_overlays(page)`.
+4. `_dismiss_overlays(page)` (synchronous, no wait).
 5. **Extract:** `combobox_fields = _extract_comboboxes(page)`, then `standard = page.evaluate(EXTRACT_JS)`.
 6. **Apply-link fallback:** if no fields detected, walk up to 2 hops following an "Apply" link/button via `_try_follow_apply_link`. Re-extract after each hop.
 7. **Location fallback:** if no `_is_location_field(f)` hit, call `_greenhouse_location_fallback(page)`. The standard extractor sometimes misses the location input due to async rendering races.

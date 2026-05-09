@@ -1,6 +1,6 @@
 # resolver.py — deep-dive
 
-211 lines. Deterministic answer resolution: preset → profile lookup → salary PPP → stored answer. Decides what reaches the AI.
+Deterministic answer resolution: preset → profile lookup → salary PPP → optional-website skip → stored answer. Decides what reaches the AI.
 
 > **Self-update reminder:** edit this doc whenever you change the resolution order, add a new branch in `try_known_resolve`, modify `PROFILE_MAPPINGS`, change the salary table, or alter `normalize_question`. The resolution-order summary in [../CLAUDE.md](../CLAUDE.md) is intentionally one line — only update it if a *new branch* is added or removed.
 
@@ -25,17 +25,20 @@ Resolution order inside the function (each step that matches **also inserts an a
 
 1. **Preset** — `profile.preset_answer(field.question)` checks `profile.yaml`'s `preset_answers:` block via `normalize_question` (case-insensitive, non-alphanumerics → spaces). On match, inserts a manual answer (`ai_generated=False`) and returns `source="preset"`.
 
-2. **Profile lookup** — `_profile_lookup(field.question, profile)` walks `PROFILE_MAPPINGS` (regex → dotted profile path) and synthesises `Full Name` from first+last when needed.
+2. **Profile lookup** — `_profile_lookup(field.question, profile, field.required)` walks `PROFILE_MAPPINGS` (regex → dotted profile path) and synthesises `Full Name` from first+last when needed.
    - **Constraint check for select fields:** if `field.options` is non-empty AND the looked-up value isn't an exact (case-insensitive) match for one of the options, the value is discarded and resolution falls through. This is why "Country" → `location.country` only fires if the country dropdown contains the exact string.
+   - **Optional website skip:** if the matched path is `links.website` and `field.required` is False, returns `None` (don't volunteer a personal site on forms that don't ask for it).
    - On accept, inserts answer with `source="profile"`.
 
 3. **Salary** — `_is_salary_question(field.question)` runs `_SALARY_RE` against the normalized question. If matched:
    - **Free-text field** (no options, not a select-type): `_compute_salary(job_location)` returns a deterministic range string. On match, inserts and returns `source="preset"`. If the location doesn't match any country in `_PPP_TABLE`, falls through to stored/AI.
    - **Select / searchable_select / has options:** **returns `(question_id, None)` immediately**, bypassing stored answers. AI must pick from the dropdown options because the deterministic value won't match exactly.
 
-4. **Stored** — `db.latest_answer(conn, question.id)`. If present, returns `source="stored"`. The answer's `value` is reused as-is.
+4. **Optional-website short-circuit** — if `not field.required` and the question matches `_WEBSITE_RE` (`^(personal\s*)?website$|portfolio`), returns `(question_id, None)` *before* the stored-answer step. Stops a value previously stored when the same question was required on another form from resurfacing on optional ones. The AI's system prompt also forbids filling website on optional fields, so the field ends up empty.
 
-5. Otherwise returns `(question_id, None)` → AI.
+5. **Stored** — `db.latest_answer(conn, question.id)`. If present, returns `source="stored"`. The answer's `value` is reused as-is.
+
+6. Otherwise returns `(question_id, None)` → AI.
 
 The whole function runs inside one `with db.connect() as conn:` block.
 
@@ -63,11 +66,11 @@ Lowercase, non-alphanumeric → space, collapse whitespace, strip. Used as the S
 
 ```python
 re.compile(
-    r"\b(salary|compensation|pay|remuneration|ctc|ectc|package|stipend|wage|cost\s+to\s+company)\b"
+    r"\b(salary|compensation|comp|pay|remuneration|ctc|ectc|package|stipend|wage|cost\s+to\s+company)\b"
 )
 ```
 
-Detects salary/compensation questions of any kind. Includes `ectc` and `cost to company` (Indian forms use these). Note this catches *all* salary-related fields including current and expected — the more specific `current ctc` mapping in `PROFILE_MAPPINGS` runs first (step 2) and only fires when "expected" isn't in the question (negative lookbehind).
+Detects salary/compensation questions of any kind. Includes `ectc`, `cost to company` (Indian forms), and bare `comp` (e.g. "Expected Comp" — `\bcomp\b` won't match inside `compensation` because of the trailing word boundary). Note this catches *all* salary-related fields including current and expected — the more specific current-comp mapping in `PROFILE_MAPPINGS` runs first (step 2) and only fires when "expected" isn't in the question (negative lookbehind).
 
 ### `_INDIA_LOC_RE`
 
@@ -111,7 +114,7 @@ Current entries (paraphrased — see source for exact regexes):
 - Location: country, city, state, postal_code/zip/pincode, address_line1
 - Links: linkedin, github, website/portfolio, twitter
 - Education: gpa/cgpa, school/university, degree, field of study/major, start year, graduation year
-- Compensation: `current ctc` / `cost to company` (with negative lookbehind for "expected")
+- Compensation: `current ctc` / `cost to company` / `current {compensation|salary|comp|package|pay|remuneration|wage}` (each with negative lookbehind for "expected")
 
 The **`Full Name` / `Name`** case is special: there's no profile key for `full_name`, so `_profile_lookup` synthesises it as `f"{first_name} {last_name}".strip()`.
 
@@ -121,9 +124,9 @@ The **`Full Name` / `Name`** case is special: there's no profile key for `full_n
 
 Empty/missing location → India default. India regex match → India default. Otherwise walks `_PPP_TABLE` and applies the math. Returns `None` for "I have no idea what country this is" — caller falls through to stored/AI.
 
-### `_profile_lookup(question, profile) -> str | None`
+### `_profile_lookup(question, profile, required) -> str | None`
 
-Normalises the question, walks `PROFILE_MAPPINGS`, calls `_resolve_path` to dig into `profile.data` by dotted path. Returns the value as `str(value).strip()` or `None`. Synthesises `Full Name` last.
+Normalises the question, walks `PROFILE_MAPPINGS`, calls `_resolve_path` to dig into `profile.data` by dotted path. Returns the value as `str(value).strip()` or `None`. Synthesises `Full Name` last. The `required` flag is used to suppress the `links.website` path when the field is optional (returns `None` for that mapping only).
 
 ### `_resolve_path(data, path) -> Any`
 
@@ -136,6 +139,10 @@ Case-insensitive exact match against any option in the list. Used to gate the pr
 ### `_is_salary_question(question) -> bool`
 
 `bool(_SALARY_RE.search(normalize_question(question)))`.
+
+### `_is_website_question(question) -> bool`
+
+`bool(_WEBSITE_RE.search(normalize_question(question)))`. Used to short-circuit resolution for optional website/portfolio fields before the stored-answer step.
 
 ## Common edits
 
@@ -150,7 +157,9 @@ Case-insensitive exact match against any option in the list. Used to gate the pr
 - **`normalize_question` changes break the DB.** Same input → different fingerprint → answers don't reuse. Treat changes as a migration.
 - **Profile lookup is gated by option matching for select fields.** If the user's `location.country` is `"India"` but the dropdown has `"India (Republic)"`, the lookup falls through. AI sees the dropdown options and picks correctly.
 - **Salary on select fields skips the stored cache too.** Logic at `is_select_type` branch returns `None` directly so AI re-picks every time. This is intentional — different forms have different option sets.
+- **Optional `website` / `portfolio` fields are intentionally left blank.** Both the profile-lookup branch and the stored-answer branch are gated on `field.required`. The AI system prompt also forbids volunteering a website on optional fields, so the value ends up empty in the form. To force-fill anyway, mark the field required upstream or add an entry to `preset_answers:` (preset wins over the gate).
 - **`PROFILE_MAPPINGS` is regex-on-normalized-text.** `[^a-z0-9 ]+` is collapsed to space, so don't put punctuation in your regex (it'll never match).
 - **`_compute_salary` returns the literal string with the rupee symbol** — it does not pass through the AI character sanitiser. The form filler types it as-is. Greenhouse text inputs handle this fine.
 - **Empty AI responses are not cached.** `runner.py` builds a `ResolvedAnswer(value="", source="ai", question_id=qid, answer_id=0)` for empty responses and never inserts into the DB — so the next run can re-ask.
-- **The `compensation.current_ctc` mapping** uses negative lookbehind `(?<!expected\s)`. If a question reads "What is your current CTC and expected CTC?", the mapping fires (because "expected" doesn't immediately precede "ctc"). Probably acceptable — answers two-question prompts with the current value.
+- **The `compensation.current_ctc` mappings** all use negative lookbehind `(?<!expected\s)`. If a question reads "What is your current CTC and expected CTC?", the mapping fires (because "expected" doesn't immediately precede "ctc"). Probably acceptable — answers two-question prompts with the current value.
+- **`comp` alone vs `compensation`.** `_SALARY_RE` lists both. `\bcomp\b` only matches the bare word ("Expected Comp", "Comp Range") — it can't match inside `compensation` because the trailing `e` blocks the word boundary. The current-comp `PROFILE_MAPPINGS` regex covers the `current` cases first, so a bare "comp" question goes through `_compute_salary` (treated as expected).

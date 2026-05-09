@@ -60,6 +60,7 @@ Rules:
 - For "How did you hear about this role?" or similar, use "LinkedIn" if no preference is set.
 - Keep prose answers concise unless the question clearly invites depth (e.g. "tell us about a project").
 - Never invent employment, education, or credentials not present in the resume or profile.
+- For personal website / portfolio URL fields: only fill when `required: True`. If the field is optional, return "" even if the profile contains a website value.
 
 Work authorization questions:
 - The work_authorization fields in the profile describe the candidate's status for FOREIGN countries (where they lack citizenship or residency). They do NOT apply to the candidate's home country.
@@ -77,6 +78,12 @@ Salary questions (only reached when the field has predefined options, or for cou
 - When the field is a select/combobox with predefined options: pick the option whose range best covers ₹30–40 LPA (or the equivalent in local currency after PPP conversion). Prefer an option that contains the target rather than one that is below it.
 - When the field is free-text: convert the India target using PPP — divide by 25 INR/intl-dollar to get $120,000–$160,000 international, then multiply by the target country's PPP factor and apply a 10% discount. Examples: US ~1.0 USD, UK ~0.70 GBP, Eurozone ~0.75 EUR, Canada ~1.30 CAD, Australia ~1.50 AUD, Singapore ~1.30 SGD. Express as a rounded range in local currency.
 - Infer the country only from explicit signals in the job URL or location string. Do NOT infer from company name. If truly no signal, use ₹30,00,000 to ₹40,00,000 per annum.
+
+Years-of-experience questions (general or skill-specific — backend, distributed systems, Python, cloud, etc.):
+- Treat the candidate's experience as exactly **4 years** for any years-of-experience question, regardless of the specific skill or domain asked about. The bio mentions "4+ years" but for option matching always anchor on 4.
+- When the field is a select/combobox with predefined ranges: pick the bucket that CONTAINS 4. Examples: options ["0-2", "3-5", "5-10", "10+"] → pick "3-5"; options ["<2 years", "2-4 years", "4-6 years", "6+ years"] → pick "4-6 years"; options ["1-3", "3-5", "5+"] → pick "3-5".
+- Never return a range/label that isn't in `options` verbatim (e.g. don't return "4+ years" if it isn't an option). If options are bucketed, you MUST pick one of them.
+- When the field is free-text or numeric: return "4".
 """
 
 

@@ -72,9 +72,11 @@ The biggest piece of behavior in this file. Source of truth for AI edge cases. S
 - **"How did you hear about this role?":** "LinkedIn" if no preference set.
 - **Conciseness:** keep prose answers short unless the question invites depth.
 - **No fabrication:** never invent jobs/education/credentials not in resume/profile.
+- **Optional website / portfolio:** only fill when `required: True`. If the field is optional, return "" even if the profile has a website value. Belt-and-braces with the resolver's optional-website short-circuit ([resolver.md](resolver.md)) — that handles the deterministic path; this rule covers the AI path.
 - **Work authorization:** the `work_authorization` keys describe the candidate's status in *foreign* countries. If the job country == candidate's `location.country`, always answer "Yes" eligible / "No" sponsorship regardless of those keys.
 - **Notice period:** exactly **60 days = 2 months = 8 weeks**. Prefer literal/exact-match options. Avoid open-ended options like "60+ days", "More than 60 days" — they overstate. If only open-ended remains and bounded options understate, pick the next-lower bounded ("45 days") rather than the open-ended one. Slight understatement > signaling longer than actual.
 - **Salary:** India target is **₹30,00,000–₹40,00,000** (30–40 LPA). For select fields, pick the option whose range best covers the target after PPP. For free-text fields, convert via PPP — divide ₹ by 25 to get $120,000–$160,000 international, multiply by target country PPP factor, apply 10% discount. Reference factors: US ~1.0 USD, UK ~0.70 GBP, EU ~0.75 EUR, CA ~1.30 CAD, AU ~1.50 AUD, SG ~1.30 SGD. Infer country only from explicit URL/location signals — never from company name. No-signal fallback: ₹30,00,000 to ₹40,00,000.
+- **Years-of-experience (any skill/domain):** anchor on **4 years exactly**. For bucketed selects, pick the option that *contains* 4 (e.g. "3-5", "4-6", "2-5"). Never return a label like "4+ years" that isn't in `options` verbatim. For free-text/number, return "4". This rule was added because the AI was returning "4+ years" literally, which never matched dropdown buckets like "3-5 years".
 
 **Edits to AI behavior go here**, not into post-processing in `runner.py`.
 

@@ -18,13 +18,15 @@ class ResolvedAnswer:
 
 _NORMALIZE_RE = re.compile(r"[^a-z0-9 ]+")
 _SALARY_RE = re.compile(
-    r"\b(salary|compensation|pay|remuneration|ctc|ectc|package|stipend|wage|cost\s+to\s+company)\b"
+    r"\b(salary|compensation|comp|pay|remuneration|ctc|ectc|package|stipend|wage|cost\s+to\s+company)\b"
 )
 
 _INDIA_LOC_RE = re.compile(
     r"\b(india|bengaluru|bangalore|mumbai|delhi|hyderabad|chennai|pune|kolkata|noida|gurugram|gurgaon)\b",
     re.I,
 )
+
+_WEBSITE_RE = re.compile(r"^(personal\s*)?website$|portfolio")
 
 # PPP base: 25 INR = 1 international dollar; India target = ₹30L–₹40L.
 # "Slightly less than PPP" = 90% of the straight PPP conversion.
@@ -94,10 +96,12 @@ PROFILE_MAPPINGS: list[tuple[str, str]] = [
     (r"\bdiscipline\b|\bfield\s+of\s+study\b|\bacademic\s+major\b|\byour\s+major\b|^major\s*$|\bconcentration\b", "education.major"),
     (r"\bstart\s*(date\s*)?year\b|\beducation\s*start\s*year\b", "education.start_year"),
     (r"\bend\s*(date\s*)?year\b|\beducation\s*end\s*year\b|\bgraduation year\b|\bgrad year\b|\byear of graduation\b", "education.graduation_year"),
-    # Only fire on "Current CTC" / "CTC" — never on "Expected CTC" / "ECTC"
+    # Only fire on "Current CTC/comp/salary/…" — never on "Expected CTC/comp/…"
     # (those should fall through to _compute_salary). Negative lookbehind blocks
-    # the "expected " prefix.
-    (r"(?<!expected\s)\b(current\s+)?ctc\b|(?<!expected\s)\b(current\s+)?cost\s+to\s+company\b", "compensation.current_ctc"),
+    # the "expected " prefix on every variant.
+    (r"(?<!expected\s)\b(current\s+)?ctc\b", "compensation.current_ctc"),
+    (r"(?<!expected\s)\b(current\s+)?cost\s+to\s+company\b", "compensation.current_ctc"),
+    (r"(?<!expected\s)\bcurrent\s+(compensation|salary|comp|package|pay|remuneration|wage)\b", "compensation.current_ctc"),
 ]
 
 
@@ -107,11 +111,15 @@ def _matches_option(value: str, options: list[str]) -> bool:
     return any(o.strip().lower() == v for o in options)
 
 
-def _profile_lookup(question: str, profile: Profile) -> str | None:
+def _profile_lookup(question: str, profile: Profile, required: bool) -> str | None:
     norm = normalize_question(question)
     for pattern, path in PROFILE_MAPPINGS:
         if not re.search(pattern, norm):
             continue
+        # Personal website / portfolio is noise on most applications — only fill
+        # when the form actually requires it.
+        if path == "links.website" and not required:
+            return None
         value = _resolve_path(profile.data, path)
         if value:
             return str(value).strip()
@@ -140,6 +148,10 @@ def _is_salary_question(question: str) -> bool:
     return bool(_SALARY_RE.search(normalize_question(question)))
 
 
+def _is_website_question(question: str) -> bool:
+    return bool(_WEBSITE_RE.search(normalize_question(question)))
+
+
 def try_known_resolve(
     field: ai.FieldSpec,
     profile: Profile,
@@ -164,7 +176,7 @@ def try_known_resolve(
             return question.id, ResolvedAnswer(value=preset, source="preset", question_id=question.id, answer_id=answer_id)
 
         # 2. Direct profile lookup (name / email / links / location).
-        profile_value = _profile_lookup(field.question, profile)
+        profile_value = _profile_lookup(field.question, profile, field.required)
         if profile_value is not None:
             # For constrained select fields, only use the profile value if it
             # exactly matches one of the available options; otherwise let AI pick.
@@ -187,6 +199,13 @@ def try_known_resolve(
                 # Unknown country, free-text field — fall through to stored/AI below
             else:
                 return question.id, None  # AI will pick from dropdown options
+
+        # Optional website fields short-circuit to None — the stored answer might
+        # be a value we filled when this same question was required on a prior form,
+        # and we don't want it resurfacing on optional ones. AI also gets told to
+        # leave it blank in that case.
+        if not field.required and _is_website_question(field.question):
+            return question.id, None
 
         stored = db.latest_answer(conn, question.id)
         if stored is not None:
