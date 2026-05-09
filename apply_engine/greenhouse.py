@@ -1035,10 +1035,12 @@ def fill_field(page: Page, field: Field, value: str, resume_path: Path | None = 
             loc.click(force=True)
         loc.fill("")  # clear pre-filled value
         # Greenhouse location/city inputs are autocomplete typeaheads — typing alone
-        # leaves the form value empty until you pick a suggestion.
+        # leaves the form value empty until you pick a suggestion. If no suggestion
+        # appears, fall back to plain typing (the field is probably not a typeahead).
         if _is_location_field(field) and value:
-            _fill_location(page, loc, value)
-            return
+            if _fill_location(page, loc, value):
+                return
+            loc.fill("")  # _fill_location may have left partial text
         # Slow type for short fields (cadence helps reCAPTCHA score); fill() for long content.
         if field.type == "textarea" or len(value) > 80:
             loc.fill(value)
@@ -1301,7 +1303,15 @@ def _type_and_pick(page: Page, selector: str, value: str) -> None:
 
 
 def _is_location_field(field: "Field") -> bool:
-    return bool(re.search(r"\b(location|city|town)\b", field.label, re.I))
+    label = field.label.strip()
+    if not re.search(r"\b(location|city|town)\b", label, re.I):
+        return False
+    # Skip custom questions that contain a colon followed by content, e.g.
+    # "Preferred location: Noida/Bengaluru" — these are plain-text questions, not
+    # autocomplete typeaheads, and routing them through _fill_location wipes the value.
+    if re.search(r"\b(location|city|town)\b\s*:", label, re.I):
+        return False
+    return True
 
 
 def _greenhouse_location_fallback(page: Page) -> "Field | None":
@@ -1690,6 +1700,7 @@ _FIND_FORM_ERRORS_JS = r"""
     }
     return null;
   };
+  const messagesByField = new Map();  // message → bool (any real-label hit?)
   const push = (field, message) => {
     const m = clean(message);
     if (!m) return;
@@ -1697,6 +1708,9 @@ _FIND_FORM_ERRORS_JS = r"""
     const key = (field || '') + '||' + m;
     if (seen.has(key)) return;
     seen.add(key);
+    // If we've already attributed this message to a real label, drop the "?" copy.
+    if (!field && messagesByField.get(m)) return;
+    if (field) messagesByField.set(m, true);
     out.push({ field: field || '?', message: m });
   };
 
@@ -1728,6 +1742,12 @@ _FIND_FORM_ERRORS_JS = r"""
   //    shows field errors as <p class="error">, <div class="form-error">, etc.
   document.querySelectorAll('form [class*="error" i], form [role="alert"]').forEach(el => {
     if (el.classList && Array.from(el.classList).some(c => /grecaptcha|captcha/i.test(c))) return;
+    // Greenhouse adds an "error" class to the <label> itself when validation fails;
+    // its text content is the field label, not an error message — skip it.
+    const tag = el.tagName;
+    if (tag === 'LABEL' || tag === 'LEGEND') return;
+    // Skip elements that wrap labels (the label's text bubbles up via textContent).
+    if (el.querySelector && el.querySelector('label, legend')) return;
     if (!isVisible(el)) return;
     const text = clean(el.textContent);
     if (!text) return;
@@ -1738,6 +1758,9 @@ _FIND_FORM_ERRORS_JS = r"""
       const lbl = wrap.querySelector('legend, label, h2, h3, h4, [class*="label" i]');
       if (lbl) label = clean(lbl.textContent);
     }
+    // Skip if the "error" text is just the field label repeated (Greenhouse wrappers
+    // sometimes have an .error class whose textContent equals the label).
+    if (label && clean(text).toLowerCase() === clean(label).toLowerCase()) return;
     push(label, text);
   });
 

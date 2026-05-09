@@ -17,7 +17,9 @@ class ResolvedAnswer:
 
 
 _NORMALIZE_RE = re.compile(r"[^a-z0-9 ]+")
-_SALARY_RE = re.compile(r"\b(salary|compensation|pay|remuneration|ctc|package|stipend|wage)\b")
+_SALARY_RE = re.compile(
+    r"\b(salary|compensation|pay|remuneration|ctc|ectc|package|stipend|wage|cost\s+to\s+company)\b"
+)
 
 _INDIA_LOC_RE = re.compile(
     r"\b(india|bengaluru|bangalore|mumbai|delhi|hyderabad|chennai|pune|kolkata|noida|gurugram|gurgaon)\b",
@@ -92,8 +94,10 @@ PROFILE_MAPPINGS: list[tuple[str, str]] = [
     (r"\bdiscipline\b|\bfield\s+of\s+study\b|\bacademic\s+major\b|\byour\s+major\b|^major\s*$|\bconcentration\b", "education.major"),
     (r"\bstart\s*(date\s*)?year\b|\beducation\s*start\s*year\b", "education.start_year"),
     (r"\bend\s*(date\s*)?year\b|\beducation\s*end\s*year\b|\bgraduation year\b|\bgrad year\b|\byear of graduation\b", "education.graduation_year"),
-    (r"\b(current\s+)?ctc\b|\bcost\s+to\s+company\b", "compensation.current_ctc"),
-    (r"\bectc\b|\bexpected\s+(ctc|cost\s+to\s+company)\b", "compensation.expected_ctc"),
+    # Only fire on "Current CTC" / "CTC" — never on "Expected CTC" / "ECTC"
+    # (those should fall through to _compute_salary). Negative lookbehind blocks
+    # the "expected " prefix.
+    (r"(?<!expected\s)\b(current\s+)?ctc\b|(?<!expected\s)\b(current\s+)?cost\s+to\s+company\b", "compensation.current_ctc"),
 ]
 
 

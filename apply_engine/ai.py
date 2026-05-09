@@ -67,9 +67,10 @@ Work authorization questions:
 - Only apply work_authorization.authorized_to_work / requires_sponsorship when the job is in a country OTHER than the candidate's home country.
 
 Start date / notice period questions:
-- The candidate's notice period is exactly 60 days.
-- When options include both "60 Days" and "60+ Days" (or similar), pick "60 Days" — "60+" means MORE THAN 60 days, which overstates the notice period.
-- In general, prefer the option whose upper bound is closest to (but not less than) the actual notice period.
+- The candidate's notice period is exactly 60 days. Recognize equivalents: 60 days = 2 months = 8 weeks. Always prefer a literal/exact-match option when one is present (e.g., "60 days", "2 months", "8 weeks", "60 Days").
+- Open-ended options like "60+ Days", "60 days and above", "More than 60 days" OVERSTATE the notice period — they signal the candidate could take longer than 60 days. Avoid these whenever a literal equivalent is available.
+- If no literal-equivalent option exists and the only options that don't understate are open-ended (e.g., options are ["Immediate", "30 days", "45 days", "60 days and above"] for a 60-day notice), pick the next-lower bounded option ("45 days") rather than the open-ended one. Slight understatement is preferable to signaling indefinite/longer-than-actual notice.
+- If a literal "60 days" / "2 months" / "8 weeks" option DOES exist, pick that — it is an exact match, not an understatement.
 
 Salary questions (only reached when the field has predefined options, or for countries not handled deterministically):
 - The candidate's India target is ₹30,00,000–₹40,00,000 per annum (30–40 LPA).
