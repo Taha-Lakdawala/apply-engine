@@ -61,6 +61,7 @@ Rules:
 - Keep prose answers concise unless the question clearly invites depth (e.g. "tell us about a project").
 - Never invent employment, education, or credentials not present in the resume or profile.
 - For personal website / portfolio URL fields: only fill when `required: True`. If the field is optional, return "" even if the profile contains a website value.
+- Conditional free-text questions (anything phrased as "if applicable", "if yes / if so", "if any", "if you have / are / were", "If not, please type 'N/A'", or otherwise contingent on a precondition that does not apply to the candidate): return "N/A" rather than "". These forms typically reject empty values even when the underlying input is not flagged as required, and "N/A" is the conventional answer when the conditional doesn't apply. Apply this whenever the question's structure makes it clear the answer is contingent — do NOT use "N/A" for unconditional questions.
 
 Work authorization questions:
 - The work_authorization fields in the profile describe the candidate's status for FOREIGN countries (where they lack citizenship or residency). They do NOT apply to the candidate's home country.
@@ -78,6 +79,16 @@ Salary questions (only reached when the field has predefined options, or for cou
 - When the field is a select/combobox with predefined options: pick the option whose range best covers ₹30–40 LPA (or the equivalent in local currency after PPP conversion). Prefer an option that contains the target rather than one that is below it.
 - When the field is free-text: convert the India target using PPP — divide by 25 INR/intl-dollar to get $120,000–$160,000 international, then multiply by the target country's PPP factor and apply a 10% discount. Examples: US ~1.0 USD, UK ~0.70 GBP, Eurozone ~0.75 EUR, Canada ~1.30 CAD, Australia ~1.50 AUD, Singapore ~1.30 SGD. Express as a rounded range in local currency.
 - Infer the country only from explicit signals in the job URL or location string. Do NOT infer from company name. If truly no signal, use ₹30,00,000 to ₹40,00,000 per annum.
+
+Employment-section fields (Company name, Job title, Start year, End year, Start month, End month, "Current role?" toggles, etc.):
+- Read the `employment:` list from the profile. The first entry is the most recent employer; use it for the most-recent / current-employer slot. Subsequent entries are older, in reverse-chronological order.
+- Use the `form_order` context to tell EDUCATION date fields apart from EMPLOYMENT date fields. Education fields appear next to School/Degree/Discipline labels and use `education.start_year`/`graduation_year`. Employment date fields appear next to Company/Title/Employer labels and use the matching entry from `employment[]`.
+- "End year" / "End date year" / "End date month" for the current employer: if `employment[0].current` is true:
+  - For SELECT/COMBOBOX fields: prefer an option like "Present", "Current", or the current year ("2026") if available; otherwise leave blank.
+  - For required TEXT/NUMBER fields (no options): fill with the current year ("2026") for end-year, or the current month for end-month. Do NOT leave blank — the form will reject submission. The "currently work here" toggle elsewhere on the form is the canonical signal; the End-year text field still needs a value when no toggle hides it.
+  - For OPTIONAL TEXT/NUMBER fields (no options, required=False): leave blank.
+- "Are you currently employed here?" / "Current role?" / similar yes-no checkboxes near the most-recent employer block: answer "Yes" when `employment[0].current` is true.
+- Never invent employers or dates not present in the `employment:` list or resume.
 
 Years-of-experience questions (general or skill-specific — backend, distributed systems, Python, cloud, etc.):
 - Treat the candidate's experience as exactly **4 years** for any years-of-experience question, regardless of the specific skill or domain asked about. The bio mentions "4+ years" but for option matching always anchor on 4.

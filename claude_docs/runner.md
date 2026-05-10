@@ -50,6 +50,7 @@ The CLI only prints to console; the report exists for programmatic callers and t
 
 ### Phase 1 — extract + deterministic resolution
 - `greenhouse.open_application(page_factory, url)` — see [greenhouse.md](greenhouse.md#open_application). Returns `(page, fields, meta)`. Sets `report.company`, `report.job_title`.
+- `greenhouse._sort_fields_by_position(page, fields)` — re-orders fields by their DOM Y-position. The extractor produces all comboboxes first, then all standard inputs, but the two groups are interleaved on the page. Without this re-sort, `form_order` (passed to the AI) clusters Education comboboxes (School/Degree/Discipline) far from Education's year text inputs, so the AI can't tell which "Start year" belongs to which section. The fill loop also iterates this sorted list, so checkbox-driven disables (e.g. "Current role" disabling adjacent End-date fields) fire in the right order.
 - `greenhouse.extract_job_description(page)` — used later for cover-letter generation.
 - For each non-file field, call `resolver.try_known_resolve(...)`:
   - On match (preset/profile/salary/stored): store the `ResolvedAnswer` in the `resolved: dict[key, ResolvedAnswer]` dict.

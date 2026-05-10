@@ -28,6 +28,15 @@ _INDIA_LOC_RE = re.compile(
 
 _WEBSITE_RE = re.compile(r"^(personal\s*)?website$|portfolio")
 
+# Generic Start/End date year/month labels appear in BOTH education and employment
+# sections of Greenhouse forms (the runner sees one field at a time, so a stored
+# answer would leak the wrong section's value into the new section). The label
+# alone can't disambiguate, so skip the stored-answer step for these and let the
+# AI batch decide using `form_order` context.
+_AMBIGUOUS_DATE_RE = re.compile(
+    r"^(start|end)\s+(date\s+)?(year|month)$"
+)
+
 # PPP base: 25 INR = 1 international dollar; India target = ₹30L–₹40L.
 # "Slightly less than PPP" = 90% of the straight PPP conversion.
 # Tuple: (location pattern, currency prefix for f"{prefix}{amount:,}", PPP factor, round_to)
@@ -94,8 +103,12 @@ PROFILE_MAPPINGS: list[tuple[str, str]] = [
     (r"\bschool\b|\buniversity\b|\bcollege\b|\binstitution\b", "education.institution"),
     (r"\bdegree\b|\bfield of study\b", "education.degree_level"),
     (r"\bdiscipline\b|\bfield\s+of\s+study\b|\bacademic\s+major\b|\byour\s+major\b|^major\s*$|\bconcentration\b", "education.major"),
-    (r"\bstart\s*(date\s*)?year\b|\beducation\s*start\s*year\b", "education.start_year"),
-    (r"\bend\s*(date\s*)?year\b|\beducation\s*end\s*year\b|\bgraduation year\b|\bgrad year\b|\byear of graduation\b", "education.graduation_year"),
+    # Generic "Start date year" / "End date year" labels appear in BOTH education
+    # and employment sections — match only on labels that explicitly call out
+    # education/graduation context, and let everything else fall through to the
+    # AI batch (which gets form_order and can pick from the right section).
+    (r"\beducation\s*start\s*(date\s*)?year\b", "education.start_year"),
+    (r"\beducation\s*end\s*(date\s*)?year\b|\bgraduation year\b|\bgrad year\b|\byear of graduation\b", "education.graduation_year"),
     # Only fire on "Current CTC/comp/salary/…" — never on "Expected CTC/comp/…"
     # (those should fall through to _compute_salary). Negative lookbehind blocks
     # the "expected " prefix on every variant.
@@ -205,6 +218,11 @@ def try_known_resolve(
         # and we don't want it resurfacing on optional ones. AI also gets told to
         # leave it blank in that case.
         if not field.required and _is_website_question(field.question):
+            return question.id, None
+
+        # Generic Start/End date labels are ambiguous (education vs employment).
+        # Skip stored to let the AI batch pick per-section via form_order.
+        if _AMBIGUOUS_DATE_RE.match(fingerprint):
             return question.id, None
 
         stored = db.latest_answer(conn, question.id)

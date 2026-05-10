@@ -52,6 +52,14 @@ def apply_to_url(
         report.company = meta.company
         report.job_title = meta.title
 
+        # Re-order fields by their actual DOM Y-position. The extractor produces
+        # comboboxes first (DOM-order within that group), then standard inputs
+        # (DOM-order within their group), but the two groups are *interleaved* on
+        # the page. Without re-sorting, form_order presented to the AI clusters
+        # all Education comboboxes together far from the Education year text fields,
+        # so the AI can't tell which Start/End year pair belongs to which section.
+        fields = greenhouse._sort_fields_by_position(page, fields)
+
         console.print(f"[bold]Found {len(fields)} fields[/bold] on {url}")
 
         job_description = greenhouse.extract_job_description(page)

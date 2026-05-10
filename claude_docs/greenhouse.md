@@ -189,7 +189,7 @@ These are common reCAPTCHA fingerprinting checkpoints.
 The high-level entry point used by `runner.py`. Flow:
 
 1. `page = page_factory(); page.goto(url, wait_until="domcontentloaded")`.
-2. **Embed handling:** if the host page is not a `greenhouse.io` URL, race `wait_for_selector` for the first useful signal — either an `iframe[src*="greenhouse.io"]` (embed pattern) or the application form selectors (inline render) — with a 5s cap. Returning on the first hit avoids the multi-second tail of `networkidle` on bloated job-board hosts. Then check for an iframe via `_find_greenhouse_iframe_url`; if found, `page.goto(iframe_url)`.
+2. **Embed handling:** if the host page is not a `greenhouse.io` URL, race `wait_for_selector` for the first useful signal — `iframe[src*="greenhouse.io"]`, the application form selectors, **or** a visible "Apply Now" / "Apply for this job" button — with a 5s cap. Returning on the first hit avoids the multi-second tail of `networkidle` on bloated job-board hosts. Then call `_maybe_click_apply_button(page)` (clicks an Apply button outside any form, but **only when the form isn't already rendered inline**). Finally check for an iframe via `_find_greenhouse_iframe_url`; if found, `page.goto(iframe_url)`.
 3. **Wait for form:** wait for Greenhouse-specific selectors (`form#application_form`, `#grnhse_app form`, `input[name='first_name']`, `input[name='email']`) up to 12s. Fall back to any `form input/select/textarea/[role='combobox']` for 5s.
 4. `_dismiss_overlays(page)` (synchronous, no wait).
 5. **Extract:** `combobox_fields = _extract_comboboxes(page)`, then `standard = page.evaluate(EXTRACT_JS)`.
@@ -212,6 +212,24 @@ Three strategies for navigating from a job-description page to the application f
 3. **Iframe injection / inline modal:** if URL didn't change, wait 2.5s for JS to inject the form. `_find_greenhouse_iframe_url` again — if found, `page.goto`. Otherwise wait for application-form selectors up to 4s.
 
 Returns the new page (could be a new tab or the same page after navigation), or `None` if nothing happened.
+
+### `_maybe_click_apply_button(page) -> Page | None`
+
+Pre-extraction step in `open_application` for non-Greenhouse host pages.
+
+**Guarded by a "form-already-inline" check.** If `form#application_form`, `#grnhse_app form`, or a `form input[name="first_name"]` is already on the page, the function returns `None` without clicking. Reason: sites that embed the Greenhouse form inline (and also show an "Apply Now" scroll-to-form button) shouldn't take the click — it can trigger a late iframe injection that redirects to a reduced post-submission view. We deliberately match on `first_name` rather than `email` because many job pages also have a talent-community/newsletter widget with its own `email` input that would falsely trip this guard. The guard fires the click on genuine job-description pages with no embedded form.
+
+Locator targets `a`/`button` elements **outside any `<form>`** (`a:not(form a)` / `button:not(form button)`). The exclusion prevents accidentally clicking a form's submit button. Three patterns:
+
+- `:has-text("Apply Now")` and `:has-text("Apply for this job")` — substring matches for distinctive phrases that won't collide with submit-button text.
+- `:text-is("Apply")` — exact-text match for the bare-word case (e.g. Roku's `weareroku.com` uses just "Apply"). Critically we do NOT use `:has-text("Apply")` here — it would match "Submit Application" via substring and risk clicking the form's submit button.
+
+Click handling:
+- `expect_page(timeout=2000)` — if the click opens a new tab, switch to it.
+- Otherwise `wait_for_url(... != prev_url, timeout=3000)` for same-tab navigation.
+- If neither happens, sleep 1.5s for inline modal/iframe injection.
+
+Returns: the new page (different tab), the same `page` (same-tab navigation or no-op), or `None` if no Apply button was found. Caller in `open_application` then runs `_find_greenhouse_iframe_url` to handle iframe-injection cases.
 
 ### `_extract_comboboxes(page) -> list[Field]`
 
@@ -320,7 +338,7 @@ Used for radio, checkbox, and post-fill checkbox re-verify in `runner.py`.
 
 #### `_is_truthy(value) -> bool`
 
-`value.strip().lower() in {"yes","true","1","on"}`.
+`value.strip().lower() in {"yes","true","1","on"}`, plus a JSON-list unwrap: when the value starts with `[`, parse and check the first element. This handles AI-emitted checkbox values like `'["Yes"]'` (the AI is told to return JSON arrays for checkbox/multiselect fields) so a single "Current role?" checkbox correctly toggles on. Without the unwrap, the literal string `'["Yes"]'` is not in the truthy set and the box stays unchecked — which masquerades as "no current job" downstream and silently makes the form's End-date-year field re-required.
 
 #### `_is_cover_letter_field(field) -> bool`
 
@@ -338,17 +356,55 @@ Wraps `_VISIBLE_OPTIONS_JS`. Dedupes preserving order.
 
 Uses `_TAG_OPTION_JS` to tag the best-matching option, then Playwright clicks the tagged element (dispatches synthetic events React handles, unlike pure DOM `.click()`). Always clears `data-ae-click-target` afterwards in `finally`.
 
+### `_open_combobox_trigger(page, selector) -> None`
+
+Robustly clicks a combobox trigger to open its dropdown. Order:
+
+1. **Blur the active element** via `document.activeElement?.blur()`. Without this, react-select's hidden ~3px input doesn't receive the click cleanly when another text field still has focus — `aria-expanded` stays `false` and the dropdown never opens.
+2. Wait 300ms for the blur event + React state to flush.
+3. Click the trigger via Playwright.
+4. Wait 400ms.
+5. If `_combobox_is_open` is still false, **fall back to clicking the wrapping `.select__control`** ancestor (walks up to 4 levels looking for any class ending in `control`). This catches react-select variants where the input itself doesn't dispatch the open handler.
+
+Use this *every* time you open a custom combobox — `_pick_combobox_option` and `_type_and_pick` both go through it.
+
+### `_combobox_is_open(page, selector) -> bool`
+
+True if the trigger reports `aria-expanded="true"` OR there is a visible non-iti `[role="listbox"]` containing at least one `[role="option"]`.
+
 ### `_pick_combobox_option(page, selector, value) -> None`
 
-1. Click the trigger.
-2. `wait_for_timeout(500)` — dropdown animation + React state settle.
+1. `_open_combobox_trigger(page, selector)`.
+2. `wait_for_timeout(200)` — let React state settle.
 3. `_click_visible_option(page, value)`.
-4. **Fallback:** if the value isn't found, try `"Other"` (custom EEO dropdowns commonly include it).
-5. **Final fallback:** Escape + raise `ValueError`.
+4. **Post-click verification:** `_trigger_looks_unselected(page, selector)` — if the trigger still shows a placeholder ("Select…", empty, etc.) the click didn't commit.
+5. **Fallback:** if the value isn't found OR didn't commit, try `"Other"` (and re-verify).
+6. **Final fallback:** Escape + raise `ValueError`.
 
 ### `_type_and_pick(page, selector, value) -> None`
 
-For long-list comboboxes (countries, cities). Click trigger, clear, `press_sequentially(value, delay=60)`. Polls `_click_visible_option` for up to 3s while the dropdown populates. On miss, clears and tries `"Other"` for up to 2s. Raises if nothing matched.
+For long-list comboboxes (countries, cities, university lists). Open via `_open_combobox_trigger`, clear, `press_sequentially(value, delay=60)`. Then **passively poll** for the dropdown to populate via `_wait_for_dropdown_options` (read-only — does not call `_click_visible_option` in a loop). When at least one `[role="option"]` is visible, click the best match once; verify commit via `_trigger_looks_unselected`.
+
+Why no poll-clicking: repeatedly calling `_click_visible_option` against an empty react-select dropdown nudges its internal "no options" state in ways that break a later "Other" fallback (the dropdown stops re-populating on subsequent typing). A single click attempt against a confirmed-populated dropdown is reliable.
+
+On miss: clear input, ensure the dropdown is still open (re-call `_open_combobox_trigger` if not), type `"Other"`, wait for population, click once. Raises `ValueError` if nothing matched.
+
+### `_wait_for_dropdown_options(page, timeout_ms) -> int`
+
+Read-only poll: every 150ms, count `[role="option"]` inside any visible non-iti `[role="listbox"]`. Returns the count when > 0, or 0 on timeout. Does not modify DOM or trigger Playwright events.
+
+### `_trigger_display_text(page, selector) -> str`
+
+Reads the visible text of a combobox trigger so callers can verify a selection committed:
+- **`<input>` / `<textarea>` (react-select):** walks up to the `.select__control` ancestor and reads `[class*="single-value"]` / `[class*="multi-value__label"]` text. react-select v5's input `.value` is always empty after commit (the selected value lives in a sibling `.select__single-value` div), so reading the input directly would falsely report "unselected" on every successful pick.
+- **Plain `<input>` / `<textarea>` (no `.*-control` ancestor):** falls back to `el.value`.
+- **Button / div:** cleaned `el.textContent`.
+
+Returns `""` on any DOM error.
+
+### `_trigger_looks_unselected(page, selector) -> bool`
+
+True if the trigger's display text is empty OR matches `_PLACEHOLDER_RE` (case-insensitive `^(select|please select|choose|pick|--|none selected)\b`). Used by `_pick_combobox_option` and `_type_and_pick` to detect silent fill failures where `_click_visible_option` returns True but the form didn't actually accept the value.
 
 ---
 
@@ -411,7 +467,7 @@ Returns one of `"verified"` | `"unverified"` | `"blocked"` | `"code_required"`.
 
 Flow:
 1. `_dismiss_overlays(page)`.
-2. **Find submit button:** locator chain `form button[type="submit"], form input[type="submit"]:not([hidden]), button:has-text("Submit Application"), button:has-text("Submit application"), button:has-text("Submit")`. Walks up to 10 candidates and picks the first **visible** one (DOM order). Raises `ValueError("No submit button found on page")` if none.
+2. **Find submit button:** locator chain `form button[type="submit"], form input[type="submit"]:not([hidden]), button:has-text("Submit Application"), button:has-text("Submit application"), button:has-text("Submit")`. **Picks by text affinity**, not DOM order — many pages carry multiple `<button type="submit">` elements (e.g. a job-favourites "Favorited" button, a talent-community widget, plus the actual application). Three-pass ranking among visible candidates: (1) text contains "submit application", (2) text contains "submit" but not "favorit"/"save…", (3) fallback to first visible. Raises `ValueError("No submit button found on page")` if none. The original "first visible in DOM order" heuristic silently clicked the wrong button on Roku-style pages (`weareroku.com`) where the favourites button comes first in DOM and looked like a successful submit-then-no-confirmation, while the application never went through.
 3. Click. `wait_for_load_state("networkidle", timeout=30000)` (swallows timeout).
 4. **Wait for outcome:** `wait_for_function` polls every frame for one of:
    - Body text matches `/thank you for applying|application (?:has been )?submitted|application received|we've received your application|thanks for applying/`.
@@ -495,6 +551,10 @@ Launches a stealth-patched Chromium with a **persistent profile**.
 - **`_TAG_OPTION_JS` clears all existing `data-ae-click-target` attributes before tagging.** Don't rely on the marker persisting between calls.
 - **`_AUTOCOMPLETE_PICK_FIRST_JS` clicks the first visible option blindly.** It's a last resort — make sure callers only invoke it after typing a search term, not on a blank dropdown.
 - **`_fill_location` clears the field on failure.** If you rely on it succeeding silently, you'll get an empty input. Always check the return value.
+- **`_click_visible_option` returning True is NOT proof the form accepted the value.** Async-loaded dropdowns (notably school/university typeaheads) can fire click events that React discards, leaving the trigger reading "Select…". Always pair the click with `_trigger_looks_unselected` if the field is required — otherwise you get a "filled" log line followed by a "field is required" submit error. `_pick_combobox_option` and `_type_and_pick` already do this; new combobox helpers must do the same.
+- **Always open a combobox via `_open_combobox_trigger`, not a bare `loc.click()`.** react-select's input is ~3px wide and only opens reliably after the previously-focused element has been blurred. A direct `loc.click()` on the next combobox after a text-field fill leaves `aria-expanded="false"` and the dropdown never appears, even though the click "succeeded" from Playwright's POV. PhonePe's full Greenhouse "ingestion form" tripped this on every dropdown until `_open_combobox_trigger` was added.
+- **react-select v5's input `.value` is always empty after commit.** The selected value is rendered in a sibling `.select__single-value` div inside the `.select__control` wrapper. `_trigger_display_text` walks up to the control ancestor and reads `[class*="single-value"]` instead of the input. Reading `el.value` directly would falsely flag every successful selection as "unselected" and cause the "Other" fallback to fire in a loop. Don't simplify it back to `el.value`.
+- **Don't poll-click `_click_visible_option` against an empty dropdown.** Repeatedly calling it while react-select shows "no options" perturbs internal state so a later `loc.fill("") + type("Other")` no longer re-populates the dropdown. Use `_wait_for_dropdown_options` (a passive read-only poll) to wait for options to appear, then click once.
 - **`_is_location_field` excludes labels containing `:`.** "Preferred location: Bangalore" is a plain text question, not a typeahead. If you add a typeahead-y label that uses a colon, this regex needs updating.
 - **`form_order` (in `runner.py`) is NOT passed to AI in the late/conditional batches.** AI accuracy on those fields is slightly lower as a result.
 - **Submit button selection prefers visible candidates** — but a visually-hidden submit input can sneak through if it's the first match in DOM order. The `:not([hidden])` only catches the HTML `hidden` attribute, not CSS hiding.

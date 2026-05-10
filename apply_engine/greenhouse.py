@@ -484,25 +484,102 @@ def _try_follow_apply_link(page: Page) -> "Page | None":
     return page
 
 
+def _maybe_click_apply_button(page: Page) -> "Page | None":
+    """If a non-form 'Apply Now' / 'Apply for this job' button is on the page AND the
+    application form isn't already rendered inline, click the button.
+
+    Returns a new Page if a new tab opened, the same `page` if a same-tab click happened,
+    or None if no apply button was found OR the form was already on the page.
+
+    Used as a pre-extraction step on non-Greenhouse host pages. The "form already
+    inline" guard exists because some sites (e.g. Roku at weareroku.com) embed the
+    full Greenhouse form below the job description AND show an Apply Now button at
+    the top. Clicking it can trigger a late iframe injection that redirects us to a
+    reduced post-submission view of the form. So: only click when we genuinely don't
+    have a form yet."""
+    # `first_name` is a Greenhouse-specific input name; matching it (or the canonical
+    # Greenhouse form selectors) tells us the application form is genuinely on the page.
+    # We deliberately do NOT match on `email` alone — many job pages have a talent-
+    # community / newsletter widget with an email input that would falsely trip this guard.
+    form_present = (
+        page.locator(
+            'form#application_form, #grnhse_app form, '
+            'form input[name="first_name"]'
+        ).count()
+        > 0
+    )
+    if form_present:
+        return None
+
+    # Use a mix of substring and exact-text selectors:
+    # - `:has-text` for distinctive phrases that won't collide with submit-button text.
+    # - `:text-is("Apply")` for the bare-word case (Roku uses just "Apply"). Crucially we
+    #   do NOT use `:has-text("Apply")` here — it would match "Submit Application" via
+    #   substring and risk clicking the form's submit button.
+    apply_btns = page.locator(
+        'a:not(form a):has-text("Apply Now"), button:not(form button):has-text("Apply Now"), '
+        'a:not(form a):has-text("Apply for this job"), button:not(form button):has-text("Apply for this job"), '
+        'a:not(form a):text-is("Apply"), button:not(form button):text-is("Apply")'
+    )
+    if apply_btns.count() == 0:
+        return None
+
+    prev_url = page.url
+    context = page.context
+    try:
+        with context.expect_page(timeout=2000) as new_page_event:
+            apply_btns.first.click(timeout=5000)
+        new_page = new_page_event.value
+        new_page.wait_for_load_state("domcontentloaded")
+        return new_page
+    except PlaywrightTimeout:
+        pass  # No new tab; fall through to same-tab handling
+    except Exception:
+        return None
+
+    try:
+        page.wait_for_url(lambda u: u != prev_url, timeout=3000)
+    except PlaywrightTimeout:
+        pass
+
+    if page.url == prev_url:
+        # No URL change; the click may have injected an iframe or rendered the form inline.
+        page.wait_for_timeout(1500)
+
+    return page
+
+
 def open_application(page_factory, url: str) -> tuple[Page, list[Field], PageMeta]:
     page = page_factory()
     page.goto(url, wait_until="domcontentloaded")
 
     # If the host page is not itself a Greenhouse domain, race for the first useful
-    # signal: either a Greenhouse iframe appears (embed pattern) or the application
-    # form renders inline. Returning on the first hit avoids the multi-second tail of
-    # `networkidle` on bloated job-board hosts (analytics, chat widgets, websockets
-    # often keep the network busy long after the form is interactive).
+    # signal: either a Greenhouse iframe appears (embed pattern), the application form
+    # renders inline, or an "Apply" button is visible. Returning on the first hit avoids
+    # the multi-second tail of `networkidle` on bloated job-board hosts (analytics, chat
+    # widgets, websockets often keep the network busy long after the form is interactive).
     if "greenhouse.io" not in page.url:
         try:
             page.wait_for_selector(
                 'iframe[src*="greenhouse.io"], '
                 "form#application_form, #grnhse_app form, "
-                "input[name='first_name'], input[name='email']",
+                "input[name='first_name'], input[name='email'], "
+                'a:has-text("Apply Now"), button:has-text("Apply Now"), '
+                'a:has-text("Apply for this job"), button:has-text("Apply for this job")',
                 timeout=5000,
             )
         except PlaywrightTimeout:
             pass
+
+        # Click an "Apply Now" / "Apply for this job" button if present. Run this before
+        # iframe lookup because some sites only inject the Greenhouse iframe after the
+        # click. Safe when the form is already on the page: same-page no-op clicks just
+        # cost a brief wait, and the button is restricted to elements outside any form
+        # to avoid hitting a submit button.
+        clicked_page = _maybe_click_apply_button(page)
+        if clicked_page is not None:
+            page = clicked_page
+
         gh_iframe_url = _find_greenhouse_iframe_url(page)
         if gh_iframe_url:
             page.goto(gh_iframe_url, wait_until="domcontentloaded")
@@ -913,8 +990,55 @@ def _extract_meta(page: Page) -> PageMeta:
     return PageMeta(title=title, company=company, location=location)
 
 
+def _sort_fields_by_position(page: Page, fields: list[Field]) -> list[Field]:
+    """Sort extracted fields by their tagged element's absolute Y-position.
+
+    The extractor pipeline runs combobox detection (``_extract_comboboxes``) and
+    standard-field detection (``EXTRACT_JS``) in two passes, and on a Greenhouse
+    form like PhonePe's the two groups are interleaved on the page. Without
+    re-sorting, the ``form_order`` block sent to the AI groups all comboboxes at
+    the top and all standard inputs at the bottom — so an Education year input
+    (number, standard) reads as "next to LinkedIn" instead of "next to School/Degree",
+    and the AI has no way to assign it to the right section.
+
+    Fields whose element can't be measured (e.g. tag was stripped during empty-options
+    recovery) sink to the end, preserving their original relative order. Returns a
+    new list — original order is preserved if measurement fails completely."""
+    keys = [f.key for f in fields]
+    try:
+        positions = page.evaluate(
+            r"""(keys) => keys.map(k => {
+                const el = document.querySelector(`[data-ae-key="${k.replace(/"/g, '\\\"')}"]`);
+                if (!el) return Number.MAX_SAFE_INTEGER;
+                const r = el.getBoundingClientRect();
+                return r.top + window.scrollY;
+            })""",
+            keys,
+        )
+    except Exception:
+        return list(fields)
+    if not isinstance(positions, list) or len(positions) != len(fields):
+        return list(fields)
+    indexed = list(enumerate(zip(positions, fields)))
+    indexed.sort(key=lambda t: (t[1][0], t[0]))
+    return [f for _, (_, f) in indexed]
+
+
 def _is_truthy(value: str) -> bool:
-    return value.strip().lower() in {"yes", "true", "1", "on"}
+    """True for affirmative scalar/JSON-list values.
+
+    Accepts plain strings ("Yes"/"true"/"1"/"on") and JSON-encoded single-item
+    lists like ``'["Yes"]'`` (which is what the AI / older stored answers emit
+    when a "Current role?" checkbox was treated as a multiselect group)."""
+    s = value.strip()
+    if s.startswith("["):
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list) and parsed:
+                s = str(parsed[0])
+        except json.JSONDecodeError:
+            pass
+    return s.strip().lower() in {"yes", "true", "1", "on"}
 
 
 def _force_check(page: Page, loc: Locator, checked: bool) -> None:
@@ -1018,6 +1142,30 @@ def _is_cover_letter_field(field: "Field") -> bool:
 
 def fill_field(page: Page, field: Field, value: str, resume_path: Path | None = None, cover_letter_path: Path | None = None) -> str | None:
     selector = f'[data-ae-key="{field.key}"]'
+
+    # An empty value on a non-file field means we have no answer to commit. Skip
+    # interaction entirely. Without this, combobox helpers would tag the first
+    # available option (since target="" matches everything as a substring) and
+    # commit a wrong value (e.g. "January" for an empty End-date-month), and
+    # text helpers would still call loc.click()+fill("") which on a *disabled*
+    # element (e.g. End-date-year auto-disabled when "Current role" is checked)
+    # blocks for the full Playwright timeout (30s) before erroring.
+    if field.type != "file" and not value.strip():
+        return "skipped"
+
+    # An element flagged disabled (or aria-disabled) means the form has decided
+    # this field shouldn't be filled — typically a date field auto-disabled by a
+    # neighbouring "currently work here" checkbox. Skip rather than wait through
+    # Playwright's actionability timeout.
+    if field.type != "file":
+        try:
+            disabled = page.locator(selector).first.evaluate(
+                "el => !!(el.disabled || el.getAttribute('aria-disabled') === 'true')"
+            )
+            if disabled:
+                return "skipped"
+        except Exception:
+            pass
 
     if field.type == "file":
         # "File upload" is the fallback label assigned when label extraction fails.
@@ -1275,37 +1423,201 @@ def _click_visible_option(page: Page, value: str) -> bool:
     return False
 
 
+_PLACEHOLDER_RE = re.compile(
+    r"^(select|please\s*select|choose|pick|none\s+selected)\b|^-{2,}", re.I
+)
+
+
+def _trigger_display_text(page: Page, selector: str) -> str:
+    """Return the visible text/value of a combobox trigger so callers can verify a
+    selection actually committed.
+
+    react-select's trigger is a hidden ``<input role="combobox">`` whose ``.value``
+    is always empty — the selected option is rendered in a sibling
+    ``.select__single-value`` div inside the ``.select__control`` wrapper. So for
+    INPUT triggers we look at the wrapper's textContent (excluding the placeholder
+    "Select..." span) before falling back to ``el.value``. Buttons/divs use their
+    own textContent. Empty string on any failure."""
+    try:
+        return page.locator(selector).first.evaluate(
+            r"""(el) => {
+                if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                    // react-select v5: walk up to .select__control (or any *-control wrapper)
+                    // and read its visible single-value / multi-value text.
+                    let cur = el;
+                    for (let i = 0; i < 6 && cur; i++) {
+                        if (cur.classList && [...cur.classList].some(c => /control$/.test(c))) {
+                            const sv = cur.querySelector('[class*="single-value"], [class*="multi-value__label"]');
+                            if (sv) {
+                                const t = (sv.textContent || '').replace(/\s+/g, ' ').trim();
+                                if (t) return t;
+                            }
+                            // No single-value div = nothing selected. Don't fall back to control text
+                            // (which would include the "Select..." placeholder).
+                            return (el.value || '').trim();
+                        }
+                        cur = cur.parentElement;
+                    }
+                    return (el.value || '').trim();
+                }
+                return (el.textContent || '').replace(/\s+/g, ' ').trim();
+            }"""
+        ) or ""
+    except Exception:
+        return ""
+
+
+def _trigger_looks_unselected(page: Page, selector: str) -> bool:
+    """True if the trigger still shows a placeholder (e.g. 'Select...') after a
+    pick attempt. Used to detect silent fill failures where _click_visible_option
+    fired a click but React/the form didn't commit the selection."""
+    text = _trigger_display_text(page, selector)
+    if not text:
+        return True
+    return bool(_PLACEHOLDER_RE.match(text))
+
+
+def _open_combobox_trigger(page: Page, selector: str) -> None:
+    """Click a combobox trigger to open its dropdown, robustly.
+
+    react-select's hidden ``<input role="combobox">`` is only ~3px wide. After a
+    previous text field is filled (which leaves focus on that input), Playwright's
+    direct click on the next combobox input may not reach the trigger that React
+    listens to — the dropdown stays closed (``aria-expanded`` remains ``false``)
+    and the subsequent option-tagging finds no visible listbox.
+
+    Blurring the currently-focused element first, then clicking, fixes it. We
+    also verify the dropdown actually opened by checking ``aria-expanded`` or a
+    visible listbox, retrying once with a forced click on the parent ``select__control``
+    wrapper if the trigger is too small to hit reliably."""
+    try:
+        page.evaluate("() => document.activeElement && document.activeElement.blur && document.activeElement.blur()")
+    except Exception:
+        pass
+    page.wait_for_timeout(300)  # let the blur event + React state flush before the next click
+    loc = page.locator(selector).first
+    loc.click()
+    page.wait_for_timeout(400)
+    if _combobox_is_open(page, selector):
+        return
+    # Fallback: click the react-select wrapper (.select__control / parent up to 3 levels).
+    try:
+        loc.evaluate(
+            r"""el => {
+                let cur = el;
+                for (let i = 0; i < 4 && cur; i++) {
+                    if (cur.classList && [...cur.classList].some(c => /control$/.test(c))) {
+                        cur.click();
+                        return;
+                    }
+                    cur = cur.parentElement;
+                }
+                // Last resort: click two levels up (typical react-select wrapper depth).
+                if (el.parentElement?.parentElement) el.parentElement.parentElement.click();
+            }"""
+        )
+    except Exception:
+        pass
+    page.wait_for_timeout(300)
+
+
+def _combobox_is_open(page: Page, selector: str) -> bool:
+    """True if the trigger reports ``aria-expanded="true"`` OR there's a visible
+    listbox other than the international-tel-input country listbox."""
+    try:
+        expanded = page.locator(selector).first.get_attribute("aria-expanded")
+        if expanded == "true":
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(page.evaluate(
+            r"""() => {
+                const lbs = [...document.querySelectorAll('[role="listbox"]')];
+                return lbs.some(lb => {
+                    if ((lb.id || '').includes('iti-')) return false;
+                    const cs = getComputedStyle(lb);
+                    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+                    if (lb.offsetParent === null && cs.position !== 'fixed') return false;
+                    return lb.querySelectorAll('[role="option"]').length > 0;
+                });
+            }"""
+        ))
+    except Exception:
+        return False
+
+
 def _pick_combobox_option(page: Page, selector: str, value: str) -> None:
-    page.locator(selector).first.click()
-    page.wait_for_timeout(500)  # allow dropdown animation / React state settle
-    if not _click_visible_option(page, value):
-        if not _click_visible_option(page, "Other"):
-            page.keyboard.press("Escape")
-            raise ValueError(f"No combobox option matches {value!r}")
+    _open_combobox_trigger(page, selector)
+    page.wait_for_timeout(200)  # allow dropdown animation / React state settle
+    if _click_visible_option(page, value):
+        page.wait_for_timeout(200)
+        if not _trigger_looks_unselected(page, selector):
+            return
+    # Value didn't pick (or click didn't commit) — try "Other" as a fallback.
+    if _click_visible_option(page, "Other"):
+        page.wait_for_timeout(200)
+        if not _trigger_looks_unselected(page, selector):
+            return
+    page.keyboard.press("Escape")
+    raise ValueError(f"No combobox option matches {value!r}")
+
+
+def _wait_for_dropdown_options(page: Page, timeout_ms: int) -> int:
+    """Poll the visible (non-iti) listboxes for at least one ``[role="option"]`` to
+    appear, returning the option count when it does (or 0 on timeout). Read-only —
+    does not touch the dropdown state."""
+    deadline = time.time() + timeout_ms / 1000.0
+    while time.time() < deadline:
+        n = page.evaluate(r"""() => {
+            const lbs = [...document.querySelectorAll('[role="listbox"]')].filter(lb => {
+                if ((lb.id || '').includes('iti-')) return false;
+                const cs = getComputedStyle(lb);
+                if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+                if (lb.offsetParent === null && cs.position !== 'fixed') return false;
+                return true;
+            });
+            return lbs.reduce((s, lb) => s + lb.querySelectorAll('[role="option"]').length, 0);
+        }""")
+        if n > 0:
+            return n
+        page.wait_for_timeout(150)
+    return 0
 
 
 def _type_and_pick(page: Page, selector: str, value: str) -> None:
-    """For long-list comboboxes (countries / city autocompletes): focus, type, then poll
-    for the dropdown to populate before clicking the best-matching option."""
+    """For long-list comboboxes (countries / city autocompletes): focus, type, wait
+    for the dropdown to populate (server-side filtering races the click), then click
+    the best match.
+
+    We wait *passively* for options to appear instead of poll-clicking — repeatedly
+    calling ``_click_visible_option`` against an empty dropdown nudges react-select's
+    internal state in ways that break a later "Other" fallback (the dropdown stops
+    re-populating on subsequent typing). One click attempt per typed value is enough
+    when we've already confirmed options are present."""
+    _open_combobox_trigger(page, selector)
     loc = page.locator(selector).first
-    loc.click()
     loc.fill("")
     loc.press_sequentially(value, delay=60)
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
+    if _wait_for_dropdown_options(page, 3000) > 0:
         if _click_visible_option(page, value):
-            page.wait_for_timeout(150)  # let React commit the selection
-            return
-        page.wait_for_timeout(150)
-    # Value not in dropdown — clear and try "Other" as fallback (e.g. unlisted schools).
+            page.wait_for_timeout(200)
+            if not _trigger_looks_unselected(page, selector):
+                return
+    # Value not in dropdown (or no options came back) — clear and try "Other" as fallback
+    # (e.g. unlisted schools). Re-open the trigger so react-select rebuilds the list:
+    # an empty input + clearing alone sometimes leaves the dropdown collapsed after a
+    # zero-results state.
     loc.fill("")
+    page.wait_for_timeout(200)
+    if not _combobox_is_open(page, selector):
+        _open_combobox_trigger(page, selector)
     loc.press_sequentially("Other", delay=60)
-    deadline = time.time() + 2.0
-    while time.time() < deadline:
+    if _wait_for_dropdown_options(page, 2000) > 0:
         if _click_visible_option(page, "Other"):
-            page.wait_for_timeout(150)
-            return
-        page.wait_for_timeout(150)
+            page.wait_for_timeout(200)
+            if not _trigger_looks_unselected(page, selector):
+                return
     raise ValueError(f"No combobox option matched {value!r} after typing")
 
 
@@ -1607,18 +1919,60 @@ def submit(page: Page) -> str:
         'button:has-text("Submit application"), '
         'button:has-text("Submit")'
     )
-    # Walk candidates in DOM order and pick the first one that is actually visible.
     if btn_loc.count() == 0:
         raise ValueError("No submit button found on page")
-    btn = btn_loc.first
-    for i in range(min(btn_loc.count(), 10)):
-        candidate = btn_loc.nth(i)
+    # Pick by text affinity, NOT raw DOM order. A page can carry multiple
+    # `<button type="submit">` elements: a job-favourites "Favorited" button, the
+    # actual application's "Submit Application" button, and a "Submit" button on a
+    # talent-community widget. The original "first visible in DOM order" heuristic
+    # silently clicked the wrong one. Three-pass ranking:
+    #   1. Visible button whose text contains "submit application" — canonical Greenhouse label.
+    #   2. Visible button whose text contains "submit" (and isn't the favourites button).
+    #   3. Fallback: first visible candidate of any kind.
+    n = min(btn_loc.count(), 10)
+
+    def _btn_text(c) -> str:
         try:
-            if candidate.is_visible():
-                btn = candidate
-                break
+            return c.evaluate(
+                "el => (el.textContent || el.value || '').replace(/\\s+/g, ' ').trim().toLowerCase()"
+            )
+        except Exception:
+            return ""
+
+    btn = None
+    for i in range(n):
+        c = btn_loc.nth(i)
+        try:
+            if not c.is_visible():
+                continue
         except Exception:
             continue
+        if "submit application" in _btn_text(c):
+            btn = c
+            break
+    if btn is None:
+        for i in range(n):
+            c = btn_loc.nth(i)
+            try:
+                if not c.is_visible():
+                    continue
+            except Exception:
+                continue
+            text = _btn_text(c)
+            if "submit" in text and "favorit" not in text and not text.startswith("save"):
+                btn = c
+                break
+    if btn is None:
+        for i in range(n):
+            c = btn_loc.nth(i)
+            try:
+                if c.is_visible():
+                    btn = c
+                    break
+            except Exception:
+                continue
+    if btn is None:
+        raise ValueError("No submit button found on page")
     btn.click()
     try:
         page.wait_for_load_state("networkidle", timeout=30000)

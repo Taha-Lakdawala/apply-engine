@@ -36,9 +36,11 @@ Resolution order inside the function (each step that matches **also inserts an a
 
 4. **Optional-website short-circuit** — if `not field.required` and the question matches `_WEBSITE_RE` (`^(personal\s*)?website$|portfolio`), returns `(question_id, None)` *before* the stored-answer step. Stops a value previously stored when the same question was required on another form from resurfacing on optional ones. The AI's system prompt also forbids filling website on optional fields, so the field ends up empty.
 
-5. **Stored** — `db.latest_answer(conn, question.id)`. If present, returns `source="stored"`. The answer's `value` is reused as-is.
+5. **Ambiguous date short-circuit** — if the normalized fingerprint matches `_AMBIGUOUS_DATE_RE` (`^(start|end)\s+(date\s+)?(year|month)$`), returns `(question_id, None)` to skip stored. These bare labels appear in BOTH education and employment sections of Greenhouse forms; reusing a stored value would leak one section's date into the other. AI is the only consumer that gets `form_order` context to disambiguate, so we always route these through the batch.
 
-6. Otherwise returns `(question_id, None)` → AI.
+6. **Stored** — `db.latest_answer(conn, question.id)`. If present, returns `source="stored"`. The answer's `value` is reused as-is.
+
+7. Otherwise returns `(question_id, None)` → AI.
 
 The whole function runs inside one `with db.connect() as conn:` block.
 
@@ -71,6 +73,14 @@ re.compile(
 ```
 
 Detects salary/compensation questions of any kind. Includes `ectc`, `cost to company` (Indian forms), and bare `comp` (e.g. "Expected Comp" — `\bcomp\b` won't match inside `compensation` because of the trailing word boundary). Note this catches *all* salary-related fields including current and expected — the more specific current-comp mapping in `PROFILE_MAPPINGS` runs first (step 2) and only fires when "expected" isn't in the question (negative lookbehind).
+
+### `_AMBIGUOUS_DATE_RE`
+
+```python
+re.compile(r"^(start|end)\s+(date\s+)?(year|month)$")
+```
+
+Matches the bare Greenhouse labels "Start date year", "End date year", "Start date month", "End date month" — which appear in BOTH the education and employment sections. Used by `try_known_resolve` to bypass the stored-answer step so the AI batch (which gets `form_order` context) is the only thing that decides per-section.
 
 ### `_INDIA_LOC_RE`
 
@@ -113,7 +123,7 @@ Current entries (paraphrased — see source for exact regexes):
 - Names: first/last/preferred/full/email/phone/pronouns/pronunciation
 - Location: country, city, state, postal_code/zip/pincode, address_line1
 - Links: linkedin, github, website/portfolio, twitter
-- Education: gpa/cgpa, school/university, degree, field of study/major, start year, graduation year
+- Education: gpa/cgpa, school/university, degree, field of study/major, **education** start year (label must contain "education"), graduation year / "year of graduation" / grad year
 - Compensation: `current ctc` / `cost to company` / `current {compensation|salary|comp|package|pay|remuneration|wage}` (each with negative lookbehind for "expected")
 
 The **`Full Name` / `Name`** case is special: there's no profile key for `full_name`, so `_profile_lookup` synthesises it as `f"{first_name} {last_name}".strip()`.
@@ -159,6 +169,8 @@ Case-insensitive exact match against any option in the list. Used to gate the pr
 - **Salary on select fields skips the stored cache too.** Logic at `is_select_type` branch returns `None` directly so AI re-picks every time. This is intentional — different forms have different option sets.
 - **Optional `website` / `portfolio` fields are intentionally left blank.** Both the profile-lookup branch and the stored-answer branch are gated on `field.required`. The AI system prompt also forbids volunteering a website on optional fields, so the value ends up empty in the form. To force-fill anyway, mark the field required upstream or add an entry to `preset_answers:` (preset wins over the gate).
 - **`PROFILE_MAPPINGS` is regex-on-normalized-text.** `[^a-z0-9 ]+` is collapsed to space, so don't put punctuation in your regex (it'll never match).
+- **Generic year labels intentionally fall through to AI.** Greenhouse forms reuse the labels "Start date year" / "End date year" in BOTH the education and employment sections, and the resolver sees one field at a time so it can't tell them apart. The education-year regex requires `\beducation\b` in the label; everything else (including bare "Start date year" in an employment block) falls through to the AI batch which gets `form_order` context and can pick the correct section. If you re-add a generic year regex here, an employment date field will silently inherit the candidate's graduation year.
+- **Bare Start/End date year/month also skip the stored-answer step.** `_AMBIGUOUS_DATE_RE` short-circuits between the optional-website check and the stored lookup. Without that, after one run stored "End date year" → "2021" (the candidate's grad year), the *employment* End-date-year field on the next form would silently inherit it instead of going to the AI batch — which knows the most-recent employer is current and would return "2026". Don't remove this short-circuit unless the resolver gains form_order context too.
 - **`_compute_salary` returns the literal string with the rupee symbol** — it does not pass through the AI character sanitiser. The form filler types it as-is. Greenhouse text inputs handle this fine.
 - **Empty AI responses are not cached.** `runner.py` builds a `ResolvedAnswer(value="", source="ai", question_id=qid, answer_id=0)` for empty responses and never inserts into the DB — so the next run can re-ask.
 - **The `compensation.current_ctc` mappings** all use negative lookbehind `(?<!expected\s)`. If a question reads "What is your current CTC and expected CTC?", the mapping fires (because "expected" doesn't immediately precede "ctc"). Probably acceptable — answers two-question prompts with the current value.

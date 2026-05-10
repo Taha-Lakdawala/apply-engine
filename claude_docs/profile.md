@@ -85,6 +85,9 @@ demographics:
 compensation:
   current_ctc
 
+employment:                      # most-recent first; reverse-chronological
+  - company, title, location, start_month, start_year, end_month, end_year, current (bool), summary
+
 bio: |
   Free-form paragraphs. Used by the AI for cover-letter-style answers.
 
@@ -109,3 +112,5 @@ resume_path: "resume.pdf"        # relative to repo root or absolute
 - **`preset_answer` lazy-imports `normalize_question`** to dodge a circular import (resolver imports profile via runner). Don't move that import to the top of the file.
 - **PDF text extraction is best-effort** — pypdf can return empty strings for image-based PDFs. If the resume is scanned, the AI sees no resume content.
 - **`docx` is the `python-docx` package**, not `docx2txt`. Watch out for typing the wrong dependency.
+- **`employment:` is consumed by the AI, not by `resolver.PROFILE_MAPPINGS`.** There are no deterministic regex mappings for company/title/employment-year fields because Greenhouse forms reuse the labels "Start date year" / "End date year" in BOTH education and employment sections, and the resolver sees one field at a time so it can't tell which section any given field belongs to. Instead, the full `employment:` list ships in `Profile.as_context()` and the AI uses `form_order` (the page-order list of all field labels) to pick the right entry. If you add a deterministic mapping like `employment.0.company`, every employer field across multi-row forms will get the same value.
+- **The engine does NOT auto-click "+ Add Employer" buttons.** A form that allows multiple employer entries will only have its first entry filled. The remaining entries in `employment:` are still useful — they appear in `Profile.as_context()`, so any free-text "describe your work history" field can list them. Adding multi-row support is a known gap.
