@@ -8,11 +8,30 @@ export default function ApplicationDetail() {
   const [data, setData] = useState<Detail | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [zoom, setZoom] = useState<string | null>(null);
+  const [zoomed, setZoomed] = useState(false);
 
   useEffect(() => {
     if (!id) return;
     api.application(Number(id)).then(setData).catch((e) => setErr(String(e)));
   }, [id]);
+
+  useEffect(() => {
+    if (!zoom) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setZoom(null);
+    };
+    window.addEventListener("keydown", onKey);
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = "";
+    };
+  }, [zoom]);
+
+  const openZoom = (url: string) => {
+    setZoom(url);
+    setZoomed(false);
+  };
 
   if (err) return <div className="flash err">{err}</div>;
   if (!data) return <div className="empty">Loading…</div>;
@@ -71,7 +90,7 @@ export default function ApplicationDetail() {
               <div className="screenshots">
                 {data.screenshots.map((s) => (
                   <div key={s.path} className="screenshot">
-                    <img src={screenshotUrl(s.path)} alt={s.label} onClick={() => setZoom(screenshotUrl(s.path))} />
+                    <img src={screenshotUrl(s.path)} alt={s.label} onClick={() => openZoom(screenshotUrl(s.path))} />
                     <div className="screenshot-label">{s.label}</div>
                   </div>
                 ))}
@@ -83,7 +102,19 @@ export default function ApplicationDetail() {
 
       {zoom && (
         <div className="lightbox" onClick={() => setZoom(null)}>
-          <img src={zoom} alt="screenshot" />
+          <button
+            className="lightbox-close"
+            onClick={(e) => { e.stopPropagation(); setZoom(null); }}
+            aria-label="Close"
+          >
+            ×
+          </button>
+          <img
+            src={zoom}
+            alt="screenshot"
+            className={zoomed ? "zoomed" : ""}
+            onClick={(e) => { e.stopPropagation(); setZoomed((z) => !z); }}
+          />
         </div>
       )}
     </>

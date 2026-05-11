@@ -1,6 +1,6 @@
 # resolver.py — deep-dive
 
-Deterministic answer resolution: preset → profile lookup → salary PPP → ambiguous-date skip → stored answer. Decides what reaches the AI.
+Deterministic answer resolution: preset → profile lookup → salary PPP → ambiguous-date skip → ambiguous-section skip → sponsorship skip → source-of-hire skip → stored answer. Decides what reaches the AI.
 
 > **Self-update reminder:** edit this doc whenever you change the resolution order, add a new branch in `try_known_resolve`, modify `PROFILE_MAPPINGS`, change the salary table, or alter `normalize_question`. The resolution-order summary in [../CLAUDE.md](../CLAUDE.md) is intentionally one line — only update it if a *new branch* is added or removed.
 
@@ -36,9 +36,15 @@ Resolution order inside the function (each step that matches **also inserts an a
 
 4. **Ambiguous date short-circuit** — if the normalized fingerprint matches `_AMBIGUOUS_DATE_RE` (`^(start|end)\s+(date\s+)?(year|month)$`), returns `(question_id, None)` to skip stored. These bare labels appear in BOTH education and employment sections of Greenhouse forms; reusing a stored value would leak one section's date into the other. AI is the only consumer that gets `form_order` context to disambiguate, so we always route these through the batch.
 
-5. **Stored** — `db.latest_answer(conn, question.id)`. If present, returns `source="stored"`. The answer's `value` is reused as-is.
+5. **Ambiguous section short-circuit** — if the fingerprint matches `_AMBIGUOUS_SECTION_RE`, returns `(question_id, None)` to skip stored. Catches bare labels like "Company name", "Current role", "Title", "Role", "Position", "Employer", "Please specify", and "Nature of Disability/Disabilities" — all of which collide across rows within one form (repeating employment/education sections) AND across companies. AI re-decides per row using `form_order` context.
 
-6. Otherwise returns `(question_id, None)` → AI.
+6. **Sponsorship / work-auth / work-eligibility short-circuit** — if the fingerprint matches `_SPONSORSHIP_RE`, returns `(question_id, None)` to skip stored. The right answer is location-dependent (Yes for jobs outside India, No for India jobs — see `SYSTEM_PROMPT` in `ai.py`), and the resolver doesn't have `job_location` in the cache key, so a stored answer from a US application would leak into an India one. AI gets `job_location` and decides per-application.
+
+7. **Source-of-hire short-circuit** — if the fingerprint matches `_SOURCE_OF_HIRE_RE` ("how/where did you hear/find out/learn/come across/discover…"), returns `(question_id, None)` to skip stored. Answer legitimately varies per application, and the generic "us"/"about us" phrasing produces the same fingerprint across companies — so a stored answer would carry the wrong channel forward.
+
+8. **Stored** — `db.latest_answer(conn, question.id)`. If present, returns `source="stored"`. The answer's `value` is reused as-is.
+
+9. Otherwise returns `(question_id, None)` → AI.
 
 The whole function runs inside one `with db.connect() as conn:` block.
 
@@ -79,6 +85,52 @@ re.compile(r"^(start|end)\s+(date\s+)?(year|month)$")
 ```
 
 Matches the bare Greenhouse labels "Start date year", "End date year", "Start date month", "End date month" — which appear in BOTH the education and employment sections. Used by `try_known_resolve` to bypass the stored-answer step so the AI batch (which gets `form_order` context) is the only thing that decides per-section.
+
+### `_AMBIGUOUS_SECTION_RE`
+
+```python
+re.compile(
+    r"^current\s+role$"
+    r"|^company(\s+name)?$"
+    r"|^employer$"
+    r"|^(job\s+)?title$"
+    r"|^role$"
+    r"|^position$"
+    r"|\bplease\s+specify\b"
+    r"|\bnature\s+of\s+disabilit",
+    re.I,
+)
+```
+
+Matches the bare/generic Greenhouse labels "Company", "Company name", "Employer", "Title", "Job title", "Role", "Current role", "Position", anything containing "please specify" (e.g. "If yes, please specify", "Other (please specify)"), and "Nature of Disability/Disabilities". These either repeat across rows in employment/education sections (one stored answer would leak into row #2) or are too vague to mean anything stable across applications. Used by `try_known_resolve` to bypass the stored-answer step. Uses `.search()` (not `.match()`) so prefixed conditional labels still trigger; "please specify" and "nature of disabilit" are word-boundary patterns so any surrounding label text fires them.
+
+### `_SPONSORSHIP_RE`
+
+```python
+re.compile(
+    r"\bsponsor(ship)?\b"
+    r"|\bvisa\b"
+    r"|\bwork\s+authoriz"
+    r"|\bauthoriz(ed|ation)\s+to\s+work\b"
+    r"|\b(eligible|eligibility|allowed|permitted)\s+to\s+work\b"
+    r"|\bright\s+to\s+work\b"
+    r"|\blegally\s+(allowed|permitted|able|entitled)\s+to\s+work\b",
+    re.I,
+)
+```
+
+Matches sponsorship / work-authorization / work-eligibility questions (e.g. "Do you require visa sponsorship?", "Are you authorized to work in the US?", "Are you currently eligible to work in one of the countries where this job is posted?", "Do you have the right to work in...?"). Bypasses the stored-answer step because the correct answer depends on the job's country, which isn't part of the cache key. Sent through the AI batch every time so `SYSTEM_PROMPT`'s home-country override fires correctly.
+
+### `_SOURCE_OF_HIRE_RE`
+
+```python
+re.compile(
+    r"\b(how|where)\s+did\s+you\s+(hear|find\s+out|learn|come\s+across|discover)\b",
+    re.I,
+)
+```
+
+Matches "How did you hear about us?", "Where did you find out about Bloomreach?", "How did you learn about this role?", "Where did you come across this opportunity?", etc. Bypasses the stored-answer step so the AI batch re-answers each time — answers like "LinkedIn" / "referral" / "recruiter" legitimately differ per application and the generic "us" phrasing produces the same fingerprint across companies.
 
 ### `_INDIA_LOC_RE`
 
@@ -165,6 +217,8 @@ Case-insensitive exact match against any option in the list. Used to gate the pr
 - **`PROFILE_MAPPINGS` is regex-on-normalized-text.** `[^a-z0-9 ]+` is collapsed to space, so don't put punctuation in your regex (it'll never match).
 - **Generic year labels intentionally fall through to AI.** Greenhouse forms reuse the labels "Start date year" / "End date year" in BOTH the education and employment sections, and the resolver sees one field at a time so it can't tell them apart. The education-year regex requires `\beducation\b` in the label; everything else (including bare "Start date year" in an employment block) falls through to the AI batch which gets `form_order` context and can pick the correct section. If you re-add a generic year regex here, an employment date field will silently inherit the candidate's graduation year.
 - **Bare Start/End date year/month also skip the stored-answer step.** `_AMBIGUOUS_DATE_RE` short-circuits between the optional-website check and the stored lookup. Without that, after one run stored "End date year" → "2021" (the candidate's grad year), the *employment* End-date-year field on the next form would silently inherit it instead of going to the AI batch — which knows the most-recent employer is current and would return "2026". Don't remove this short-circuit unless the resolver gains form_order context too.
+- **`_AMBIGUOUS_SECTION_RE` also skips the stored step** for the same reason as dates. Greenhouse repeats labels like "Company name", "Current role", and "Title" in every employment/education row, so the resolver can't distinguish row #1 from row #2 by fingerprint alone. "Please specify" is the most generic case — same fingerprint, completely different meaning across forms. "Nature of disability" is conditional and shouldn't carry a stored value forward. When adding labels here, prefer anchored patterns (`^...$`) so you don't accidentally swallow longer labels that *do* carry context (e.g. "Current company name where you work most recently" should NOT match `^company(\s+name)?$`).
+- **Sponsorship/visa/work-auth/work-eligibility questions also skip stored.** `_SPONSORSHIP_RE` short-circuits right after the ambiguous-date check. The answer is location-dependent (per `SYSTEM_PROMPT`: home country → "No" for sponsorship / "Yes" for eligibility, elsewhere → flipped), and the cache key is just the question fingerprint with no country in it, so a stored answer from a US application would otherwise leak into an India application. The AI batch sees `job_location` and applies the home-country override correctly. When extending the regex, remember the inverse phrasings — "require sponsorship" (No in home country) and "eligible to work" (Yes in home country) — are both location-dependent in opposite directions.
 - **`_compute_salary` returns the literal string with the rupee symbol** — it does not pass through the AI character sanitiser. The form filler types it as-is. Greenhouse text inputs handle this fine.
 - **Empty AI responses are not cached.** `runner.py` builds a `ResolvedAnswer(value="", source="ai", question_id=qid, answer_id=0)` for empty responses and never inserts into the DB — so the next run can re-ask.
 - **The `compensation.current_ctc` mappings** all use negative lookbehind `(?<!expected\s)`. If a question reads "What is your current CTC and expected CTC?", the mapping fires (because "expected" doesn't immediately precede "ctc"). Probably acceptable — answers two-question prompts with the current value.

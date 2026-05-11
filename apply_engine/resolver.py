@@ -35,6 +35,54 @@ _AMBIGUOUS_DATE_RE = re.compile(
     r"^(start|end)\s+(date\s+)?(year|month)$"
 )
 
+# Other section-scoped or too-generic labels that repeat across employment /
+# education rows or carry no useful cache key on their own. "Company name",
+# "Current role", "Title", and "Please specify" all collide across rows
+# within one form AND across companies, so a stored answer from row #1 (or a
+# prior application) would leak into row #2. "Nature of Disability" is
+# conditional on a Yes answer to the disability question and shouldn't carry
+# a stored value forward. Skip the stored-answer step for all of these and
+# let the AI batch decide per-row using form_order context.
+_AMBIGUOUS_SECTION_RE = re.compile(
+    r"^current\s+role$"
+    r"|^company(\s+name)?$"
+    r"|^employer$"
+    r"|^(job\s+)?title$"
+    r"|^role$"
+    r"|^position$"
+    r"|\bplease\s+specify\b"
+    r"|\bnature\s+of\s+disabilit",
+    re.I,
+)
+
+# Sponsorship / work-authorization / work-eligibility answers depend on the
+# job's country (Yes for jobs outside the candidate's home country, No for
+# India jobs — see SYSTEM_PROMPT). A stored answer from a US application
+# would leak into an India application and vice versa, so always re-ask the
+# AI which has job_location context. Covers: "visa sponsorship", "work
+# authorization", "authorized/eligible/allowed/permitted/legally able to
+# work", and "right to work".
+_SPONSORSHIP_RE = re.compile(
+    r"\bsponsor(ship)?\b"
+    r"|\bvisa\b"
+    r"|\bwork\s+authoriz"
+    r"|\bauthoriz(ed|ation)\s+to\s+work\b"
+    r"|\b(eligible|eligibility|allowed|permitted)\s+to\s+work\b"
+    r"|\bright\s+to\s+work\b"
+    r"|\blegally\s+(allowed|permitted|able|entitled)\s+to\s+work\b",
+    re.I,
+)
+
+# "How/where did you hear about <company>?" style questions. The answer
+# legitimately varies per application (LinkedIn for one, referral for
+# another, recruiter reach-out for a third), and questions without the
+# company name in the label collide across companies in the cache — so
+# always re-ask the AI rather than letting a stored answer carry forward.
+_SOURCE_OF_HIRE_RE = re.compile(
+    r"\b(how|where)\s+did\s+you\s+(hear|find\s+out|learn|come\s+across|discover)\b",
+    re.I,
+)
+
 # PPP base: 25 INR = 1 international dollar; India target = ₹30L–₹40L.
 # "Slightly less than PPP" = 90% of the straight PPP conversion.
 # Tuple: (location pattern, currency prefix for f"{prefix}{amount:,}", PPP factor, round_to)
@@ -212,6 +260,22 @@ def try_known_resolve(
         # Generic Start/End date labels are ambiguous (education vs employment).
         # Skip stored to let the AI batch pick per-section via form_order.
         if _AMBIGUOUS_DATE_RE.match(fingerprint):
+            return question.id, None
+
+        # "Company name", "Current role", "Title", "Please specify", "Nature of
+        # Disability" — too broad to cache. Skip stored so AI re-decides per
+        # row / per application.
+        if _AMBIGUOUS_SECTION_RE.search(fingerprint):
+            return question.id, None
+
+        # Sponsorship / work-authorization answers vary by job country, so never
+        # reuse a cached answer — let the AI batch decide with job_location.
+        if _SPONSORSHIP_RE.search(fingerprint):
+            return question.id, None
+
+        # "How/where did you hear about us?" varies per application and the
+        # generic "us" phrasing collides across companies — always re-ask.
+        if _SOURCE_OF_HIRE_RE.search(fingerprint):
             return question.id, None
 
         stored = db.latest_answer(conn, question.id)

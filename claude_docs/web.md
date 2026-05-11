@@ -1,6 +1,6 @@
 # [apply_engine/web/server.py](../apply_engine/web/server.py)
 
-FastAPI dashboard. Served by `apply dashboard`. Read-only over the SQLite DB except for two writes: `PUT /api/profile` (rewrites `profile.yaml`, with timestamped `.bak` backup) and `PUT /api/answers/{question_id}` (inserts a new manual answer row, mirroring `apply edit`).
+FastAPI dashboard. Served by `apply dashboard`. Read-only over the SQLite DB except for three writes: `PUT /api/profile` (rewrites `profile.yaml`, with timestamped `.bak` backup), `PUT /api/answers/{question_id}` (inserts a new manual answer row, mirroring `apply edit`), and `DELETE /api/questions/{question_id}` (drops a cached question; answers cascade).
 
 By design this server **never triggers Playwright**. Adding a "run application from the UI" button means subprocess management, log streaming, and browser conflicts — out of scope for now.
 
@@ -27,6 +27,7 @@ All under `/api/`.
 | PUT | `/api/profile` | Body: `{data: {...}}`. Backs up existing file to `profile.yaml.bak.<timestamp>`, then writes the new YAML via `yaml.safe_dump(sort_keys=False)`. |
 | GET | `/api/questions` | All `(question, latest answer)` pairs via `db.all_qa_pairs`. |
 | PUT | `/api/answers/{question_id}` | Body: `{value: "..."}`. Inserts a new answer row (`ai_generated=0`, `reviewed_at=now`) via `db.update_answer_value`. |
+| DELETE | `/api/questions/{question_id}` | Deletes the question; answers cascade. 404 if the id is unknown. |
 
 ## Q&A linkage
 
@@ -71,7 +72,7 @@ React 18 + Vite + react-router-dom. No state library (just `useState`/`useEffect
 | `src/pages/Applications.tsx` | Filterable table (status dropdown + free-text search). |
 | `src/pages/ApplicationDetail.tsx` | Per-application Q&A + screenshots with click-to-zoom lightbox. |
 | `src/pages/Profile.tsx` | Section-by-section editor (personal/location/links/work-auth/demographics/bio/resume/preset-answers). Saves the whole document via `PUT /api/profile`. |
-| `src/pages/Questions.tsx` | Searchable Q&A table with inline edit (PUT to `/api/answers/{qid}`). |
+| `src/pages/Questions.tsx` | Searchable Q&A table with inline edit (PUT to `/api/answers/{qid}`) and delete (DELETE `/api/questions/{qid}`, guarded by `window.confirm`). |
 
 ### Dev mode
 

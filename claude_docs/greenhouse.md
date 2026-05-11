@@ -98,7 +98,7 @@ Most of this file's volume is inline JavaScript run via `page.evaluate(...)`. Li
 
 ### `COMBOBOX_TAG_JS`
 
-Runs before `EXTRACT_JS`. Tags every visible `[role="combobox"]` (skipping ones inside listboxes — those are search-inside-dropdown helpers). For each:
+Runs before `EXTRACT_JS`. **Scoped to the application form** (same form-picker heuristic as `EXTRACT_JS`: known Greenhouse IDs first, else the form with the most non-hidden inputs; falls back to `document` only if no `<form>` exists). Scoping matters on multi-form host pages — e.g. Roku's `weareroku.com` renders a department/location filter form next to the actual application form, and a document-wide scan used to tag those filter dropdowns as fake fields (wasting AI calls, potentially mutating page state via filter selection). Tags every visible `[role="combobox"]` in scope (skipping ones inside listboxes — those are search-inside-dropdown helpers). For each:
 - Resolves a label via `aria-labelledby` → `aria-label` → wrapper `legend|label|h*|[class*=label]`.
 - Sets `data-ae-key="aecb_<i>"` and `data-ae-combobox="1"`.
 - Marks sibling `aria-hidden="true"` inputs (the shadow value-holding input) as `data-ae-skip="1"` so the standard pass ignores them.
@@ -119,7 +119,19 @@ The main extractor. Lines 71-272. Picks the application form (`#grnhse_app form`
    - `tel` → `phone`. Non-`text|email|tel|url|number|date` falls back to `text`.
 4. **Skips** already-tagged elements (`[data-ae-key]` from `COMBOBOX_TAG_JS`) and `[data-ae-skip="1"]`. Also skips `[type=search]` (search-inside-dropdown helpers) and `aria-hidden="true"` elements.
 
-Label resolution priority (`labelFor`): `<label for=id>` → `<label>` ancestor → `aria-label` → `aria-labelledby` → wrapper `legend|h*|label|[class*=label]`. "attach"/"upload"/"choose file"/"browse" labels are rejected (they're button labels, not field labels).
+Label resolution priority (`labelFor`):
+1. `<label for=id>`
+2. `<label>` ancestor (`closest('label')`)
+3. `aria-label`
+4. `aria-labelledby`
+5. **Walk-up to a direct-child label** — for each ancestor up to 6 levels, look for a label-like direct child (`<label>`, `<legend>`, or `[class*="label"]`) that appears in DOM order BEFORE the input's branch. Returns the most-recent such label at the nearest level. This handles Bootstrap-style grouped sub-inputs (e.g. Roku's education `start_month` + `start_year` both nested in `.col-md-6.form-group` inside `.row` inside `.form-group.start-date` — the parent `.form-group.start-date` carries the `<label>Start date</label>` as a direct child). Without this step, the wrap-based fallback below walked up to the outer `.education-question-group` and returned its FIRST label ("School") for every nested input, silently mis-labeling every date sub-input.
+6. **Wrap-based fallback** — `closest('.field-wrapper, .field, .form-field, fieldset, [data-testid], [class*="question"], [class*="Field"]')`, then `querySelector('legend, h2, h3, h4, label, [class*="label"]')`. Kept for inputs whose section label is nested inside a non-label div (e.g. Roku's `.form-group.school` wraps the label in `.d-flex` — the walk-up at step 5 only inspects direct children and won't find it, so this fallback fires).
+
+Labels are post-processed through `decorateWithHint(text, input)` at every return path: if the input's placeholder is a canonical date-format token (`MM`/`YYYY`/`YY`/`DD`), the hint (`month` / `year` / `day`) is appended to the label. So `start_month` (placeholder `MM`) and `start_year` (placeholder `YYYY`) — which would otherwise both resolve to "Start date" — become "Start date month" and "Start date year". The hint patterns are intentionally narrow (only exact uppercase tokens) to avoid spurious decoration of non-date inputs whose placeholder happens to be short.
+
+"attach"/"upload"/"choose file"/"browse" labels are rejected (they're button labels, not field labels).
+
+`cleanText(el)` strips `.required`, `[aria-label="required"]`, **`.ada-unique-content` and `[class*="unique-content"]`** spans before reading text. The unique-content classes target accessibility-id spans (e.g. Roku injects `<span class="ada-unique-content">cb2c75ff</span>` inside every label for screen-reader disambiguation) that would otherwise pollute labels with random hex strings — bleeding into the AI prompt and the resolver fingerprint cache.
 
 For radio groups, `groupLabel(radio)` walks up to the `<fieldset><legend>` first, then to a wrapper element.
 
@@ -255,7 +267,14 @@ Otherwise same as `_extract_comboboxes`: open, read options, dedupe, classify by
 ### `_extract_meta(page) -> PageMeta`
 
 - **Title:** `page.title()`.
-- **Company:** `.company-name`, `#header h1`, `header h1`, `[class*="company"]` (first match wins).
+- **Company:** four fallback strategies, first non-empty wins (and is then normalized):
+  1. **DOM selectors** — `.company-name`, `#header h1`, `header h1`, `[class*="company-name"]`. Length-capped at 80 chars (avoids accidentally pulling a whole sub-header). The class glob now requires "company-name" specifically rather than any `[class*="company"]` — the looser glob was matching `company-description` / `our-company` blocks and dumping marketing copy into the company field.
+  2. **Meta tags** — `og:site_name`, `application-name`, `author`. Skips generic platform names via a `GENERIC` regex (`greenhouse|lever|workable|smartrecruiters|ashby|ats|careers?|jobs?`) so Greenhouse-hosted boards don't return `"Greenhouse"`.
+  3. **Title regexes** — three patterns tried in order:
+     - `\bat\s+([A-Z]…)(?:\s*[|–—·\-]|\s*$)` → matches `"Job Application for <role> at <Company>"` (standard Greenhouse).
+     - `^([A-Z]…)\s+(?:Jobs?|Careers?)\b` → matches `"<Company> Jobs - <role>"` (Roku-style hosts).
+     - `^([A-Z]…)\s*\|` → matches `"<Company> | <role>"`, with a guard rejecting candidates that contain `jobs?` / `careers?` / `job application`.
+  4. **Normalization** — strip trailing ATS/corporate-suffix tokens (`-jobs`, ` careers`, ` hiring`, etc.) from whichever path succeeded. Without this, og:site_name `"Roku Jobs"` would leak through as the company name; the title regex would have caught `"Roku"` cleanly but only fires when meta tags miss.
 - **Location:**
   1. Dedicated location selectors (`.location`, `[class*="location"]`, `[class*="job-location"]`, `[data-qa="job-location"]`, `.posting-location`, `.job__location`, `.header__location`, `.job-header__location`, `[itemprop="addressLocality"]`, `[itemtype*="JobPosting"] [itemprop="jobLocation"]`).
   2. `<meta name="description">` / `og:description` — best-effort hint.
@@ -563,3 +582,7 @@ Launches a stealth-patched Chromium with a **persistent profile**.
 - **`verify_submission` regex is the source of truth for "submitted" detection.** Greenhouse text wording changes have broken this in the past — if you see a false `unverified`, broaden the regex.
 - **Persistent profile dir is keyed only by path** — running two `apply` commands in parallel will conflict. Single-process at a time.
 - **`with_browser` returns `(pw, None, page_factory, cleanup)`** — the second slot is a leftover from a prior non-persistent design. Don't try to use it as a `Browser` handle.
+- **`labelFor`'s walk-up uses "label appears before input's branch in DOM order".** It iterates direct children at each ancestor level and tracks the most-recent label seen until it hits the child that contains the input. This is the right heuristic for grouped sub-inputs but also handles flat `<label>X<input id=X><label>Y<input id=Y>` structures correctly (input Y's walk-up sees label X first then label Y, returns Y). If you change this, verify both shapes still work.
+- **Placeholder hints fire on `MM`/`YYYY`/`YY`/`DD` exactly** (uppercase, no surrounding whitespace beyond trim). Don't broaden the patterns without checking that real-world inputs don't use those tokens for non-date semantics (e.g. an honorific dropdown with placeholder `Mr` is safe today because we don't match `Mr`, but adding `M` would break it).
+- **Roku-style multi-form host pages.** `weareroku.com` renders two forms with overlapping submit-button text and `[role="combobox"]` elements: a small department/location filter form, and the actual application form. Both `EXTRACT_JS` and `COMBOBOX_TAG_JS` now scope to the picked application form (same heuristic in both). The `submit()` text-ranking selects the right "Submit Application" button. If a future host page splits the application across multiple forms, the form-picker (largest by non-hidden-input count) would need rethinking.
+- **Roku "candidate-known" disabled inputs.** When the persistent profile has interacted with `weareroku.com` before, Roku pre-fills First/Last/Email/Phone inputs with `disabled="disabled"` and a `value` but **no `name`** attribute. The extractor skips them (the `el.disabled` early-return at line ~274), which is correct — those values are submitted by Roku's backend via session state, not by the form. Don't try to "fix" this by force-enabling them; the visible inputs have empty `name` attributes and would be no-op in form data anyway.

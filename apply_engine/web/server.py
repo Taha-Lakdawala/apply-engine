@@ -318,6 +318,15 @@ def create_app() -> FastAPI:
             conn.commit()
         return {"ok": True, "answer_id": new_id}
 
+    @app.delete("/api/questions/{question_id}")
+    def delete_question(question_id: int) -> dict[str, Any]:
+        with db.connect() as conn:
+            deleted = db.delete_question(conn, question_id)
+            conn.commit()
+        if not deleted:
+            raise HTTPException(status_code=404, detail="question not found")
+        return {"ok": True}
+
     # ---------- static frontend ----------
 
     if WEBUI_DIST.exists():

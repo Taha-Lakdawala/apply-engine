@@ -35,6 +35,19 @@ export default function Questions() {
     }
   };
 
+  const remove = async (qid: number, question: string) => {
+    const preview = question.length > 80 ? question.slice(0, 80) + "…" : question;
+    if (!window.confirm(`Delete cached answer for:\n\n${preview}\n\nThis removes the question and its answer history. The next application that asks it will get a fresh answer.`)) {
+      return;
+    }
+    try {
+      await api.deleteQuestion(qid);
+      await load();
+    } catch (e) {
+      setErr(String(e));
+    }
+  };
+
   return (
     <>
       <h1 className="page-title">Questions</h1>
@@ -66,7 +79,7 @@ export default function Questions() {
               <th>Answer</th>
               <th style={{ width: 110 }}>Source</th>
               <th style={{ width: 110 }}>Updated</th>
-              <th style={{ width: 90 }}></th>
+              <th style={{ width: 160 }}></th>
             </tr>
           </thead>
           <tbody>
@@ -99,7 +112,10 @@ export default function Questions() {
                       <button className="ghost" onClick={() => setEditing(null)}>Cancel</button>
                     </div>
                   ) : (
-                    <button className="ghost" onClick={() => { setEditing(qa.question_id); setDraft(qa.value); }}>Edit</button>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button className="ghost" onClick={() => { setEditing(qa.question_id); setDraft(qa.value); }}>Edit</button>
+                      <button className="ghost danger" onClick={() => remove(qa.question_id, qa.question)}>Delete</button>
+                    </div>
                   )}
                 </td>
               </tr>

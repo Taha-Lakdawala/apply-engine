@@ -43,7 +43,8 @@ CREATE TABLE applications (
     error                   TEXT,
     screenshots_dir         TEXT,            -- repo-relative path to data/applications/<run>/
     pre_submit_screenshot   TEXT,            -- repo-relative path to pre_submit.png
-    post_submit_screenshot  TEXT             -- repo-relative path to post_submit.png
+    post_submit_screenshot  TEXT,            -- repo-relative path to post_submit.png
+    prior_attempts          TEXT             -- JSON array of archived prior-attempt snapshots
 );
 
 CREATE INDEX idx_applications_url_status ON applications(url, status);
@@ -129,9 +130,21 @@ Sets `reviewed_at = _now()` on the given answer.
 
 **Inserts a new row** marked `ai_generated=0` and `reviewed_at=<now>`. This is "the user manually fixed this answer" — it supersedes any AI answer for this question on next read because `latest_answer` orders by `created_at DESC`.
 
+### `delete_question(conn, question_id) -> bool`
+
+Deletes the `questions` row. Answers cascade via the FK (`ON DELETE CASCADE`, with `PRAGMA foreign_keys = ON` set in `connect()`). Returns `True` if a row was actually deleted, `False` if no such id. Used by the dashboard's `DELETE /api/questions/{id}`.
+
 ### `record_application(conn, url, company, job_title, status, error=None, screenshots_dir=None, pre_submit_screenshot=None, post_submit_screenshot=None) -> int`
 
-Inserts into `applications`. `submitted_at` only set when `status == 'submitted'`. Status values used elsewhere: `submitted` | `filled` | `failed` (set by `runner.apply_to_url`). The three path columns are repo-relative paths supplied by the runner; pass `None` when no screenshot was taken.
+Upgrade-or-insert. Looks up the **most recent** prior row for this exact `url`:
+
+- **No prior row** → INSERT new row. `submitted_at` set only when `status == 'submitted'`.
+- **Prior row is `filled` or `failed`** → UPDATE that row in place with the new outcome. The pre-update `{status, error, screenshots_dir, pre_submit_screenshot, post_submit_screenshot, created_at, archived_at}` snapshot is appended to the `prior_attempts` JSON list, so the failure history is preserved when a re-apply succeeds (or fails differently).
+- **Prior row is `submitted`** → INSERT new row anyway. This case is rare in practice because `runner.apply_to_url` short-circuits via `find_successful_application` unless `--force` was passed; if it does happen, we don't clobber the original success.
+
+Status values used elsewhere: `submitted` | `filled` | `failed` (set by `runner.apply_to_url`). The three screenshot path columns are repo-relative paths supplied by the runner; pass `None` when no screenshot was taken.
+
+The function returns the row id that was inserted-or-updated, so callers can re-fetch the row if they need to.
 
 ### `find_successful_application(conn, url) -> sqlite3.Row | None`
 
@@ -147,7 +160,8 @@ Most recent `applications` row with this exact `url` and `status = 'submitted'`.
 ## Gotchas
 
 - **Minimal migration system.** `init_db()` runs the `CREATE TABLE IF NOT EXISTS` script, then for each entry in `_APPLICATIONS_MIGRATIONS` runs an `ALTER TABLE applications ADD COLUMN`, swallowing the `OperationalError` when the column already exists. Only `applications` has migrations wired up today. If you add a column to `questions` or `answers`, extend the migration list (or add a parallel one) — otherwise existing DBs won't get it.
+- **`record_application` is upgrade-or-insert, not append-only.** A re-apply that succeeds (or fails differently) on a URL with a prior `filled`/`failed` row will **mutate that row's columns** and archive the old state into `prior_attempts`. This is intentional — keeps one canonical row per URL across retry cycles — but it means the dashboard's "applications" page shows the latest outcome only; the failure history lives in the JSON column. If you need full history, query `prior_attempts` (or render its entries in the UI).
 - **`connect()` doesn't rollback on exceptions.** A function that does multiple writes and raises will leave partial state. Most accessors do single writes so this rarely matters in practice.
 - **`upsert_question` ignores incoming `field_type`/`options` on conflict.** If a question's options change between applications (rare — Greenhouse forms tend to be stable), the stored options stay outdated. Probably not worth fixing unless a real bug surfaces.
 - **`raw_text` on the Question row is whatever was first inserted.** If two applications phrase the same fingerprint slightly differently, you'll keep the first phrasing.
-- **Foreign keys:** `ON DELETE CASCADE` on `answers.question_id`. Deleting a question wipes its answers. There's no UI for either.
+- **Foreign keys:** `ON DELETE CASCADE` on `answers.question_id`. Deleting a question wipes its answers. The dashboard's Questions page exposes a Delete button (calls `db.delete_question`); there's no CLI command.

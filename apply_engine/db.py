@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS applications (
     error                   TEXT,
     screenshots_dir         TEXT,
     pre_submit_screenshot   TEXT,
-    post_submit_screenshot  TEXT
+    post_submit_screenshot  TEXT,
+    prior_attempts          TEXT   -- JSON array of past failed-attempt snapshots
 );
 
 CREATE INDEX IF NOT EXISTS idx_applications_url_status
@@ -58,6 +59,7 @@ _APPLICATIONS_MIGRATIONS = [
     ("screenshots_dir", "TEXT"),
     ("pre_submit_screenshot", "TEXT"),
     ("post_submit_screenshot", "TEXT"),
+    ("prior_attempts", "TEXT"),
 ]
 
 
@@ -258,6 +260,12 @@ def update_answer_value(conn: sqlite3.Connection, question_id: int, value: str) 
     return cur.lastrowid
 
 
+def delete_question(conn: sqlite3.Connection, question_id: int) -> bool:
+    """Delete a cached question. Answers cascade via FK. Returns True if a row was deleted."""
+    cur = conn.execute("DELETE FROM questions WHERE id = ?", (question_id,))
+    return cur.rowcount > 0
+
+
 def record_application(
     conn: sqlite3.Connection,
     url: str,
@@ -269,14 +277,81 @@ def record_application(
     pre_submit_screenshot: str | None = None,
     post_submit_screenshot: str | None = None,
 ) -> int:
+    """Insert a new applications row, or — if the prior most-recent row for this URL
+    is a non-success (``filled`` / ``failed``) — upgrade that row in place and archive
+    its previous state into ``prior_attempts``. This keeps one row per URL across
+    retry cycles while preserving the failure history.
+
+    Behaviour:
+    - No prior row for this URL → INSERT new row.
+    - Prior row exists with status ``submitted`` → INSERT new row (don't clobber the
+      successful submission; downstream `find_successful_application` will still hit
+      the older successful row, but the new row records the redundant retry).
+    - Prior row exists with status ``filled`` or ``failed`` → UPDATE in place. The
+      pre-update {status, error, screenshots, created_at} is appended to
+      ``prior_attempts`` (JSON list) so the original failure detail isn't lost.
+    """
     submitted_at = _now() if status == "submitted" else None
+    now = _now()
+
+    prior = conn.execute(
+        """SELECT id, status, error, screenshots_dir, pre_submit_screenshot,
+                  post_submit_screenshot, created_at, prior_attempts
+             FROM applications
+            WHERE url = ?
+            ORDER BY id DESC LIMIT 1""",
+        (url,),
+    ).fetchone()
+
+    if prior and prior["status"] in ("filled", "failed"):
+        history: list[dict] = []
+        existing = prior["prior_attempts"]
+        if existing:
+            try:
+                parsed = json.loads(existing)
+                if isinstance(parsed, list):
+                    history = parsed
+            except json.JSONDecodeError:
+                history = []
+        history.append({
+            "status": prior["status"],
+            "error": prior["error"],
+            "screenshots_dir": prior["screenshots_dir"],
+            "pre_submit_screenshot": prior["pre_submit_screenshot"],
+            "post_submit_screenshot": prior["post_submit_screenshot"],
+            "created_at": prior["created_at"],
+            "archived_at": now,
+        })
+
+        conn.execute(
+            """UPDATE applications
+                  SET company = ?,
+                      job_title = ?,
+                      status = ?,
+                      submitted_at = ?,
+                      created_at = ?,
+                      error = ?,
+                      screenshots_dir = ?,
+                      pre_submit_screenshot = ?,
+                      post_submit_screenshot = ?,
+                      prior_attempts = ?
+                WHERE id = ?""",
+            (
+                company, job_title, status, submitted_at, now, error,
+                screenshots_dir, pre_submit_screenshot, post_submit_screenshot,
+                json.dumps(history),
+                prior["id"],
+            ),
+        )
+        return prior["id"]
+
     cur = conn.execute(
         """INSERT INTO applications (
                 url, company, job_title, status, submitted_at, created_at, error,
                 screenshots_dir, pre_submit_screenshot, post_submit_screenshot
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            url, company, job_title, status, submitted_at, _now(), error,
+            url, company, job_title, status, submitted_at, now, error,
             screenshots_dir, pre_submit_screenshot, post_submit_screenshot,
         ),
     )

@@ -63,6 +63,8 @@ export const api = {
     req<{ ok: boolean }>("/api/profile", { method: "PUT", body: JSON.stringify({ data }) }),
   updateAnswer: (questionId: number, value: string) =>
     req<{ ok: boolean }>(`/api/answers/${questionId}`, { method: "PUT", body: JSON.stringify({ value }) }),
+  deleteQuestion: (questionId: number) =>
+    req<{ ok: boolean }>(`/api/questions/${questionId}`, { method: "DELETE" }),
 };
 
 export function screenshotUrl(path: string): string {

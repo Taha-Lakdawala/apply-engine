@@ -82,11 +82,14 @@ Salary questions (only reached when the field has predefined options, or for cou
 
 Employment-section fields (Company name, Job title, Start year, End year, Start month, End month, "Current role?" toggles, etc.):
 - Read the `employment:` list from the profile. The first entry is the most recent employer; use it for the most-recent / current-employer slot. Subsequent entries are older, in reverse-chronological order.
-- Use the `form_order` context to tell EDUCATION date fields apart from EMPLOYMENT date fields. Education fields appear next to School/Degree/Discipline labels and use `education.start_year`/`graduation_year`. Employment date fields appear next to Company/Title/Employer labels and use the matching entry from `employment[]`.
+- Use the `form_order` context to tell EDUCATION date fields apart from EMPLOYMENT date fields. Education date fields are the ones that appear AFTER School/Degree/Discipline (or "University", "Major") in `form_order`; employment date fields appear AFTER Company/Title/Employer. The bare labels "Start date year", "Start date month", "End date year", "End date month", "Start year", "End year", "Graduation year" can mean either — section is determined entirely by the preceding labels in `form_order`. When in doubt, look at which set of labels is closest above the date field in form_order.
+- For EDUCATION date fields:
+  - **Start year / End year (graduation year):** use `education.start_year` and `education.graduation_year` respectively. NEVER use employment start dates here.
+  - **Start month / End month (graduation month):** the profile typically has no education month data. For number inputs (placeholder "MM", min=1 max=12) return a bare integer ("9" for start, "6" for end — September start, June graduation are sensible defaults). For text inputs return the month name. For selects pick the option matching the same default.
+  - **Education end-year (graduation) is essentially always required** by the form even when not flagged — fill it with `graduation_year`. Same goes for the end-MONTH on number inputs: fill it, never leave blank.
 - "End year" / "End date year" / "End date month" for the current employer: if `employment[0].current` is true:
   - For SELECT/COMBOBOX fields: prefer an option like "Present", "Current", or the current year ("2026") if available; otherwise leave blank.
-  - For required TEXT/NUMBER fields (no options): fill with the current year ("2026") for end-year, or the current month for end-month. Do NOT leave blank — the form will reject submission. The "currently work here" toggle elsewhere on the form is the canonical signal; the End-year text field still needs a value when no toggle hides it.
-  - For OPTIONAL TEXT/NUMBER fields (no options, required=False): leave blank.
+  - For TEXT/NUMBER fields (no options) — REGARDLESS of the `required` flag: fill with the current year ("2026") for end-year, or the current month ("May") for end-month. Greenhouse forms often validate End-date on submit even when the underlying input is not flagged required, so leaving these blank causes submit rejection. The exception is when an adjacent "Currently work here" toggle has visibly hidden/disabled the End-date input — but you can't see that, so always fill.
 - "Are you currently employed here?" / "Current role?" / similar yes-no checkboxes near the most-recent employer block: answer "Yes" when `employment[0].current` is true.
 - Never invent employers or dates not present in the `employment:` list or resume.
 

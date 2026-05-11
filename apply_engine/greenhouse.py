@@ -18,7 +18,15 @@ from . import ai
 COMBOBOX_TAG_JS = r"""
 () => {
   const out = [];
+  // Resume past the highest existing aecb_N (same pattern as the standard extractor).
   let i = 0;
+  document.querySelectorAll('[data-ae-key]').forEach(el => {
+    const m = (el.getAttribute('data-ae-key') || '').match(/^aecb_(\d+)$/);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (n + 1 > i) i = n + 1;
+    }
+  });
   const isVisible = (el) => {
     const cs = getComputedStyle(el);
     if (cs.display === 'none' || cs.visibility === 'hidden') return false;
@@ -27,13 +35,36 @@ COMBOBOX_TAG_JS = r"""
   };
   const cleanText = (el) => {
     if (!el) return null;
-    const required = el.querySelector?.('.required, [aria-label="required"]');
+    const required = el.querySelector?.('.required, [aria-label="required"], .ada-unique-content, [class*="unique-content"]');
     if (required) required.remove();
     const t = (el.textContent || '').replace(/\s+/g, ' ').replace(/\*+$/, '').replace(/\(required\)$/i, '').trim();
     return t || null;
   };
 
-  document.querySelectorAll('[role="combobox"]').forEach(el => {
+  // Pick the application form (mirrors EXTRACT_JS). When there are multiple
+  // forms on a host page — e.g. Roku's weareroku.com renders a department/
+  // location filter form alongside the actual application form — the standard
+  // extractor scopes to the largest form, but COMBOBOX_TAG_JS used to scan
+  // the whole document and tag the filter dropdowns as application fields.
+  // Those bogus fields then burned AI calls and could perturb the URL via
+  // filter state. Scope to the picked application form (with a document
+  // fallback for sites that don't wrap fields in a <form>).
+  let appForm = document.querySelector(
+    '#grnhse_app form, form#application_form, form#application-form, form[action*="greenhouse.io"]'
+  );
+  if (!appForm) {
+    let best = null, bestCount = -1;
+    for (const f of document.querySelectorAll('form')) {
+      const n = f.querySelectorAll(
+        'input:not([type="hidden"]):not([type="submit"]):not([type="button"]), select, textarea'
+      ).length;
+      if (n > bestCount) { bestCount = n; best = f; }
+    }
+    appForm = best;
+  }
+  const scope = appForm || document;
+
+  scope.querySelectorAll('[role="combobox"]').forEach(el => {
     if (!isVisible(el)) return;
     if (el.closest('[role="listbox"]')) return;  // search-inside-dropdown
     let label = null;
@@ -73,7 +104,11 @@ EXTRACT_JS = r"""
   const cleanText = (el) => {
     if (!el) return null;
     const clone = el.cloneNode(true);
-    clone.querySelectorAll('.required, [aria-label="required"]').forEach(n => n.remove());
+    // Strip required-indicator spans + accessibility "unique-content" spans that
+    // some forms (Roku) inject for screen-reader disambiguation. They contain
+    // short random hex strings that bleed into the label and pollute the AI
+    // prompt / resolver fingerprint.
+    clone.querySelectorAll('.required, [aria-label="required"], .ada-unique-content, [class*="unique-content"]').forEach(n => n.remove());
     let t = clone.textContent || '';
     t = t.replace(/\s+/g, ' ').replace(/\*+$/, '').replace(/\(required\)$/i, '').trim();
     return t || null;
@@ -88,35 +123,91 @@ EXTRACT_JS = r"""
     return true;
   };
 
+  // Placeholder-derived hint to disambiguate sub-inputs that share a section
+  // label (e.g. month+year inputs both under "Start date" — without a hint the
+  // AI sees two identical labels and can't tell which gets the year value).
+  // Intentionally conservative: only fires on canonical 2-/4-char format tokens
+  // so a regular short placeholder ("Mr") never triggers spurious decoration.
+  const placeholderHint = (input) => {
+    const ph = (input.placeholder || '').trim().toUpperCase();
+    if (ph === 'MM') return 'month';
+    if (ph === 'YYYY' || ph === 'YY') return 'year';
+    if (ph === 'DD') return 'day';
+    return null;
+  };
+  const decorateWithHint = (text, input) => {
+    const hint = placeholderHint(input);
+    if (!hint) return text;
+    if (text.toLowerCase().includes(hint)) return text;
+    return `${text} ${hint}`;
+  };
   const labelFor = (input) => {
     if (input.id) {
       try {
         const lbl = document.querySelector(`label[for="${CSS.escape(input.id)}"]`);
         if (lbl) {
           const txt = cleanText(lbl);
-          if (txt && !/^(attach|upload|choose file|browse)$/i.test(txt)) return txt;
+          if (txt && !/^(attach|upload|choose file|browse)$/i.test(txt)) return decorateWithHint(txt, input);
         }
       } catch (e) {}
     }
     const parentLabel = input.closest('label');
     if (parentLabel) {
       const txt = cleanText(parentLabel);
-      if (txt && !/^(attach|upload|choose file|browse)$/i.test(txt)) return txt;
+      if (txt && !/^(attach|upload|choose file|browse)$/i.test(txt)) return decorateWithHint(txt, input);
     }
     const aria = input.getAttribute('aria-label');
-    if (aria) return aria.trim();
+    if (aria) return decorateWithHint(aria.trim(), input);
     const labelledBy = input.getAttribute('aria-labelledby');
     if (labelledBy) {
       const lbl = document.getElementById(labelledBy);
-      if (lbl) return cleanText(lbl);
+      if (lbl) {
+        const txt = cleanText(lbl);
+        if (txt) return decorateWithHint(txt, input);
+      }
     }
-    // Walk up to a field wrapper and look for a heading/legend.
+    // Walk up looking for the nearest ancestor whose direct children include
+    // a label preceding the input's branch (in DOM order). This handles
+    // Bootstrap-style date pickers where two number inputs (month + year) sit
+    // inside a `.row` whose parent `.form-group.start-date` carries the
+    // "Start date" label as a direct-child <label>. The old wrap-based
+    // fallback below would walk up further to `.education-question-group` and
+    // return its FIRST label ("School") for every nested input, mis-labeling
+    // every date sub-input as "School" and causing fills to land in the wrong
+    // place (or be silently rejected by number inputs).
+    let node = input.parentElement;
+    let inputBranch = input;
+    for (let i = 0; i < 6 && node; i++) {
+      let labelCandidate = null;
+      for (const child of node.children) {
+        if (child === inputBranch || (child.contains && child.contains(input))) {
+          if (labelCandidate) {
+            const txt = cleanText(labelCandidate);
+            if (txt && !/^(attach|upload|choose file|browse)$/i.test(txt)) {
+              return decorateWithHint(txt, input);
+            }
+          }
+          break;
+        }
+        const isLabelLike = child.tagName === 'LABEL' || child.tagName === 'LEGEND' ||
+          (child.matches && child.matches('[class*="label"]'));
+        // Skip elements that contain a form control — they're wrappers around
+        // inputs (e.g. <label><input></label>), not section labels.
+        if (isLabelLike && !(child.querySelector && child.querySelector('input, select, textarea, button'))) {
+          labelCandidate = child;
+        }
+      }
+      inputBranch = node;
+      node = node.parentElement;
+    }
+    // Existing wrap-based fallback (kept for inputs whose section label is
+    // nested inside another div, e.g. `<div class="d-flex"><label>...</label></div>`).
     const wrap = input.closest('.field-wrapper, .field, .form-field, fieldset, [data-testid], [class*="question"], [class*="Field"]');
     if (wrap) {
       const heading = wrap.querySelector('legend, h2, h3, h4, label, [class*="label"]');
       if (heading) {
         const txt = cleanText(heading);
-        if (txt) return txt;
+        if (txt) return decorateWithHint(txt, input);
       }
     }
     return null;
@@ -155,8 +246,46 @@ EXTRACT_JS = r"""
 
   const fields = [];
   const seen = new Set();
+
+  // Resume the counter past the highest `ae_N` already in the DOM, so a re-extraction
+  // pass (e.g. conditional fields appearing after an answer is filled) doesn't reuse
+  // a key that's already attached to an earlier element. Without this, selectors like
+  // `[data-ae-key="ae_1"]` match the original tagged input AND the newly tagged one,
+  // and `.first` returns the wrong element — causing fills to land on a stale field.
   let counter = 0;
+  form.querySelectorAll('[data-ae-key]').forEach(el => {
+    const m = (el.getAttribute('data-ae-key') || '').match(/^ae_(\d+)$/);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (n > counter) counter = n;
+    }
+  });
   const nextKey = () => `ae_${++counter}`;
+
+  // Greenhouse forms often use aria-required / data-required instead of the HTML
+  // `required` attribute, but the server-side submit handler still rejects empty
+  // values. Treat any of these signals as "required" for the AI prompt.
+  const isRequired = (el) => {
+    if (!el) return false;
+    if (el.required) return true;
+    const ar = el.getAttribute && el.getAttribute('aria-required');
+    if (ar === 'true' || ar === '') return true;
+    const dr = el.getAttribute && el.getAttribute('data-required');
+    if (dr === 'true' || dr === '1') return true;
+    // Walk up to the question group / fieldset and check for "required" CSS hints.
+    const wrap = el.closest && el.closest(
+      '.field-wrapper, .field, .form-field, fieldset, [data-testid], [class*="question"], [class*="Field"], [id^="question_"]'
+    );
+    if (wrap) {
+      if (wrap.classList && (wrap.classList.contains('required') || wrap.classList.contains('is-required'))) return true;
+      // Greenhouse marks required-question labels with a visible "*" inside a span/em.
+      const star = wrap.querySelector && wrap.querySelector('label .required, label [aria-label="required"], legend .required, legend [aria-label="required"]');
+      if (star) return true;
+      const lblTxt = wrap.querySelector && wrap.querySelector('label, legend');
+      if (lblTxt && /\*\s*$/.test((lblTxt.textContent || '').trim())) return true;
+    }
+    return false;
+  };
 
   // Skip already-tagged combobox inputs and their shadows.
   form.querySelectorAll('[data-ae-key], [data-ae-skip="1"]').forEach(el => seen.add(el));
@@ -180,7 +309,7 @@ EXTRACT_JS = r"""
       options.push(opt);
       seen.add(r);
     });
-    fields.push({ key, type: 'radio', label, name, required: radios.some(r => r.required), options, maxLength: null });
+    fields.push({ key, type: 'radio', label, name, required: radios.some(isRequired), options, maxLength: null });
   }
 
   // Checkbox groups (multiple checkboxes sharing a name) vs single boolean checkbox
@@ -192,7 +321,7 @@ EXTRACT_JS = r"""
       const key = nextKey();
       c.setAttribute('data-ae-key', key);
       const label = labelFor(c);
-      if (label) fields.push({ key, type: 'checkbox', label, name: c.name, required: c.required, options: ['Yes', 'No'], maxLength: null });
+      if (label) fields.push({ key, type: 'checkbox', label, name: c.name, required: isRequired(c), options: ['Yes', 'No'], maxLength: null });
       seen.add(c);
       return;
     }
@@ -205,7 +334,7 @@ EXTRACT_JS = r"""
       const key = nextKey();
       c.setAttribute('data-ae-key', key);
       const label = labelFor(c);
-      if (label) fields.push({ key, type: 'checkbox', label, name, required: c.required, options: ['Yes', 'No'], maxLength: null });
+      if (label) fields.push({ key, type: 'checkbox', label, name, required: isRequired(c), options: ['Yes', 'No'], maxLength: null });
       seen.add(c);
       continue;
     }
@@ -219,7 +348,7 @@ EXTRACT_JS = r"""
       options.push(opt);
       seen.add(c);
     });
-    fields.push({ key, type: 'multiselect', label, name, required: boxes.some(c => c.required), options, maxLength: null });
+    fields.push({ key, type: 'multiselect', label, name, required: boxes.some(isRequired), options, maxLength: null });
   }
 
   // Standard text/select/textarea/file
@@ -260,7 +389,7 @@ EXTRACT_JS = r"""
       key, type,
       label: label || 'File upload',
       name: el.name,
-      required: el.required || false,
+      required: isRequired(el),
       options,
       maxLength: el.maxLength > 0 ? el.maxLength : null,
     });
@@ -647,7 +776,16 @@ def open_application(page_factory, url: str) -> tuple[Page, list[Field], PageMet
 _CUSTOM_SELECT_JS = r"""
 () => {
   const out = [];
+  // Resume past the highest existing ae_custom_N so a second pass (conditional fields)
+  // doesn't reuse keys already attached to elements tagged in the first pass.
   let idx = 0;
+  document.querySelectorAll('[data-ae-key]').forEach(el => {
+    const m = (el.getAttribute('data-ae-key') || '').match(/^ae_custom_(\d+)$/);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (n + 1 > idx) idx = n + 1;
+    }
+  });
   const already = el => el.getAttribute('data-ae-key') || el.getAttribute('data-ae-skip');
   const clean = s => (s || '').replace(/\s+/g, ' ').replace(/\*+$/, '').replace(/\(required\)$/i, '').trim();
   const stripSelect = s => s.replace(/\s*Select\.{0,3}\s*$/i, '').replace(/\*+$/, '').trim();
@@ -943,16 +1081,61 @@ def _extract_meta(page: Page) -> PageMeta:
     try:
         company = page.evaluate(
             """() => {
-                const sel = ['.company-name', '#header h1', 'header h1', '[class*="company"]'];
+                // 1. Dedicated DOM selectors — when present these are the most reliable.
+                const sel = ['.company-name', '#header h1', 'header h1', '[class*="company-name"]'];
                 for (const s of sel) {
                     const el = document.querySelector(s);
-                    if (el && el.textContent.trim()) return el.textContent.trim();
+                    const t = el && el.textContent.trim();
+                    if (t && t.length < 80) return t;
+                }
+                // 2. Meta tags. og:site_name carries the company on most career-site
+                //    hosts; skip generic platform names ("Greenhouse", "Lever") that
+                //    leak through Greenhouse-hosted boards.
+                const metas = [
+                    document.querySelector('meta[property="og:site_name"]'),
+                    document.querySelector('meta[name="application-name"]'),
+                    document.querySelector('meta[name="author"]'),
+                ];
+                const GENERIC = /^(greenhouse|lever|workable|smartrecruiters|ashby|ats|careers?|jobs?)$/i;
+                for (const m of metas) {
+                    const c = m && (m.getAttribute('content') || '').trim();
+                    if (c && !GENERIC.test(c) && c.length < 80) return c;
                 }
                 return null;
             }"""
         )
     except Exception:
         pass
+
+    # 3. Parse from page title — Greenhouse-hosted boards use the canonical
+    #    "Job Application for <role> at <Company>" format, and many ATS hosts
+    #    use "<Company> Jobs - <role>" (Roku) or "<Company> | <role>".
+    if not company and title:
+        import re as _re
+        # "at <Company>" — anchor at end or before a separator. Greenhouse standard.
+        m = _re.search(r"\bat\s+([A-Z][A-Za-z0-9&.\-\s]{1,60}?)(?:\s*[|–—·\-]|\s*$)", title)
+        if m:
+            company = m.group(1).strip().rstrip(",")
+        else:
+            # "<Company> Jobs - …" — Roku, others.
+            m = _re.match(r"^\s*([A-Z][A-Za-z0-9&.\-]{1,40})\s+(?:Jobs?|Careers?)\b", title)
+            if m:
+                company = m.group(1).strip()
+            else:
+                # "<Company> | <role>" — common across career sites.
+                m = _re.match(r"^\s*([A-Z][A-Za-z0-9&.\-\s]{1,40}?)\s*\|", title)
+                if m:
+                    candidate = m.group(1).strip()
+                    if not _re.search(r"\b(jobs?|careers?|job application)\b", candidate, _re.I):
+                        company = candidate
+
+    # 4. Normalize — strip trailing ATS / corporate-suffix tokens that leak
+    #    through og:site_name (e.g. "Roku Jobs", "Acme Careers", "FooCorp Inc").
+    if company:
+        import re as _re
+        company = _re.sub(r"\s*[-|·–—,]\s*(jobs?|careers?|hiring).*$", "", company, flags=_re.I)
+        company = _re.sub(r"\s+(jobs?|careers?|hiring)\s*$", "", company, flags=_re.I)
+        company = company.strip().rstrip(",")
     try:
         location = page.evaluate(
             """() => {
