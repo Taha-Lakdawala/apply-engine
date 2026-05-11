@@ -95,6 +95,15 @@ preset_answers:                  # exact-question overrides; beats everything el
   "How did you hear about this job?": "LinkedIn"
   "Years of experience with Python": "5"
 
+bulk_apply:                      # consumed by `apply bulk` (bulk.py)
+  skip_titles:                   # case-insensitive substrings; missing → DEFAULT_SKIP_TITLES
+    - director
+    - manager
+    - business analyst
+    - iOS
+    - SDET
+    - Test
+
 resume_path: "resume.pdf"        # relative to repo root or absolute
 ```
 

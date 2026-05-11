@@ -338,14 +338,6 @@ def apply_to_url(
                                 "Code may have been rejected.[/red]"
                             )
 
-                        # Snapshot before clicking, in case it errors again
-                        snap = app_dir / "recode_pre_submit.png"
-                        try:
-                            page.screenshot(path=str(snap), full_page=True)
-                            console.print(f"[dim]Pre-final-submit screenshot: {snap}[/dim]")
-                        except Exception:
-                            pass
-
                         console.print("[bold]Re-submitting with code...[/bold]")
                         status = greenhouse.submit(page)
 

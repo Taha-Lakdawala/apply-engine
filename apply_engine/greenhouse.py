@@ -1324,6 +1324,12 @@ def _is_cover_letter_field(field: "Field") -> bool:
 
 
 def fill_field(page: Page, field: Field, value: str, resume_path: Path | None = None, cover_letter_path: Path | None = None) -> str | None:
+    # Defensive: a Field with no key can't be located. Without this guard,
+    # `[data-ae-key=""]` matches nothing and Playwright blocks on the full
+    # actionability timeout (30s) — visible as `Locator.set_input_files: Timeout
+    # 30000ms exceeded. waiting for locator("").first`.
+    if not field.key:
+        return "skipped"
     selector = f'[data-ae-key="{field.key}"]'
 
     # An empty value on a non-file field means we have no answer to commit. Skip

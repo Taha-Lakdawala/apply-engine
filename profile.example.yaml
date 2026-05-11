@@ -48,5 +48,16 @@ preset_answers:
   # "How did you hear about this job?": "LinkedIn"
   # "Years of experience with Python": "5"
 
+# Used by `apply bulk` to skip junk results from my.greenhouse.io/dashboard.
+# Case-insensitive substring match against the scraped job title.
+bulk_apply:
+  skip_titles:
+    - director
+    - manager
+    - business analyst
+    - iOS
+    - SDET
+    - Test
+
 # Path to your resume (PDF or DOCX). Relative to repo root or absolute.
 resume_path: "resume.pdf"

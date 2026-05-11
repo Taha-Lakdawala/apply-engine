@@ -1,6 +1,6 @@
 # db.py — deep-dive
 
-255 lines. SQLite schema + accessor functions. **Read this when changing the schema, adding a query, or debugging answer-cache behavior.**
+386 lines. SQLite schema + accessor functions. **Read this when changing the schema, adding a query, or debugging answer-cache behavior.**
 
 > **Self-update reminder:** edit this doc whenever you change the schema, add a new accessor, or change the fingerprint contract. The schema summary in [CLAUDE.md](../CLAUDE.md) is intentionally brief — update it only when you add/remove a *table*.
 
@@ -145,6 +145,10 @@ Upgrade-or-insert. Looks up the **most recent** prior row for this exact `url`:
 Status values used elsewhere: `submitted` | `filled` | `failed` (set by `runner.apply_to_url`). The three screenshot path columns are repo-relative paths supplied by the runner; pass `None` when no screenshot was taken.
 
 The function returns the row id that was inserted-or-updated, so callers can re-fetch the row if they need to.
+
+### `submitted_urls(conn) -> set[str]`
+
+Returns every distinct `applications.url` with `status = 'submitted'`. Used by `bulk.bulk_apply` to pre-filter candidate jobs from the dashboard scrape before they reach `apply_to_url`. Exact-string matches — the bulk caller normalises both sides (strips query/fragment) before comparing. Cheap: index `idx_applications_url_status` covers the lookup.
 
 ### `find_successful_application(conn, url) -> sqlite3.Row | None`
 

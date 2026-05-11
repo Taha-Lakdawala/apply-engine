@@ -1,6 +1,6 @@
 # cli.py — deep-dive
 
-Typer CLI entry point. 207 lines. **Read this when adding/changing a command, or before touching `main()` or any `@app.command()`.**
+Typer CLI entry point. 288 lines. **Read this when adding/changing a command, or before touching `main()` or any `@app.command()`.**
 
 > **Self-update reminder:** if you add/rename a command, change a flag, or alter command behavior, update this file in the same patch. Update the CLI commands list in [CLAUDE.md](../CLAUDE.md) only if a *new top-level command* is added.
 
@@ -40,6 +40,27 @@ def apply_cmd(
 ```
 
 Loads the profile, then calls `runner.apply_to_url(url, profile, headless=..., submit=not no_submit, manual_submit=..., force=force)`. The positional-URL shortcut is implemented in `main()` (see below). `--force` overrides the runner's re-apply guard (which otherwise skips URLs that already have a `submitted` row in the `applications` table).
+
+### `bulk`
+
+```python
+@app.command(name="bulk")
+def bulk_cmd(
+    title: str | None = None,        # --title / -t
+    location: str | None = None,     # --location / -l (required)
+    count: int | None = None,        # --count / -n
+    headless: bool = False,          # --headless
+    no_submit: bool = False,         # --no-submit
+    manual_submit: bool = False,     # --manual-submit
+    list_only: bool = False,         # --list
+)
+```
+
+Searches `https://my.greenhouse.io/dashboard` for jobs matching `title` (default `software`) in `location` (required, prompts if omitted), filters out skip-list matches and previously-submitted URLs, then loops `runner.apply_to_url` over the survivors (up to `count`, default `10`).
+
+Any flag left as `None` triggers an interactive `Prompt.ask`. The `--list` flag prints the candidate URLs and exits without applying — useful for verifying the search before launching the apply loop. Skip-list keywords live in `profile.yaml` under `bulk_apply.skip_titles` (falls back to `bulk.DEFAULT_SKIP_TITLES` if missing).
+
+Per-job behaviour is unchanged — each candidate goes through the same `apply_to_url` pipeline with its own `--no-submit` / `--manual-submit` forwarding. Re-apply guard for individual URLs still fires inside the runner. Full module details: [bulk.md](bulk.md).
 
 ### `dry-run`
 

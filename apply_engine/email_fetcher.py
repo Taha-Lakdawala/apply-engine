@@ -166,15 +166,40 @@ def _decode_part(part: email.message.Message) -> str:
 _CODE_TOKEN = re.compile(r"\b([A-Za-z0-9]{6,12})\b")
 
 
+_CODE_DENY_WORDS = {
+    "greenhouse",
+    "mygreenhouse",
+    "linkedin",
+    "indeed",
+    "anthropic",
+    "password",
+    "security",
+}
+
+
 def _extract_code(body: str) -> str | None:
-    """Greenhouse format: 'Copy and paste this code into the security code field on your application:\n\nCODE'."""
-    # Anchored extraction first.
+    """Greenhouse formats:
+
+    Application security code email:
+        ``Copy and paste this code into the security code field on your application:\\n\\nCODE``
+    MyGreenhouse login email:
+        ``Your security code is:\\n\\n********\\nCODE\\n********``
+    """
+    # Application-form security code.
     m = re.search(
         r"code\s+into\s+the\s+security\s+code\s+field[^:]*:\s*([A-Za-z0-9]{6,12})",
         body, re.I | re.S,
     )
     if m:
         return m.group(1)
+    # MyGreenhouse sign-in email — code wrapped in `********` separators.
+    m = re.search(
+        r"security code is:[^A-Za-z0-9]+([A-Za-z0-9]{6,12})",
+        body, re.I | re.S,
+    )
+    if m:
+        return m.group(1)
+    # Generic "security code: CODE" form.
     m = re.search(r"security code[^:]*:\s*([A-Za-z0-9]{6,12})", body, re.I | re.S)
     if m:
         return m.group(1)
@@ -185,6 +210,8 @@ def _extract_code(body: str) -> str | None:
     for line in body.splitlines():
         s = line.strip()
         if not _CODE_TOKEN.fullmatch(s):
+            continue
+        if s.lower() in _CODE_DENY_WORDS:
             continue
         has_letter = any(c.isalpha() for c in s)
         has_digit = any(c.isdigit() for c in s)

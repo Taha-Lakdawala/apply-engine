@@ -358,6 +358,17 @@ def record_application(
     return cur.lastrowid
 
 
+def submitted_urls(conn: sqlite3.Connection) -> set[str]:
+    """Every URL that has at least one ``status='submitted'`` row.
+
+    Used by ``bulk`` to pre-filter candidate jobs so we don't waste a
+    bulk-count slot on a URL the runner would skip anyway."""
+    rows = conn.execute(
+        "SELECT DISTINCT url FROM applications WHERE status = 'submitted'"
+    ).fetchall()
+    return {r["url"] for r in rows}
+
+
 def find_successful_application(
     conn: sqlite3.Connection, url: str
 ) -> sqlite3.Row | None:

@@ -34,12 +34,13 @@ The app uses **Gemini** (`google-genai`). Default model `gemini-2.5-flash`, over
 
 | File | Lines | Role | Deep-dive |
 |---|---|---|---|
-| [cli.py](apply_engine/cli.py) | 207 | Typer CLI commands. | [claude_docs/cli.md](claude_docs/cli.md) |
+| [cli.py](apply_engine/cli.py) | 288 | Typer CLI commands. | [claude_docs/cli.md](claude_docs/cli.md) |
 | [runner.py](apply_engine/runner.py) | 503 | Orchestrates one application end-to-end. | [claude_docs/runner.md](claude_docs/runner.md) |
+| [bulk.py](apply_engine/bulk.py) | 371 | Searches my.greenhouse.io/dashboard, filters, then loops `apply_to_url`. | [claude_docs/bulk.md](claude_docs/bulk.md) |
 | [resolver.py](apply_engine/resolver.py) | 211 | Deterministic answer resolution (preset/profile/salary/stored). | [claude_docs/resolver.md](claude_docs/resolver.md) |
 | [ai.py](apply_engine/ai.py) | 241 | Gemini client, system prompt, batch field answerer, cover letters. | [claude_docs/ai.md](claude_docs/ai.md) |
 | [greenhouse.py](apply_engine/greenhouse.py) | 1864 | All Playwright/DOM logic. The big one. | [claude_docs/greenhouse.md](claude_docs/greenhouse.md) |
-| [db.py](apply_engine/db.py) | 255 | SQLite schema and accessors. | [claude_docs/db.md](claude_docs/db.md) |
+| [db.py](apply_engine/db.py) | 386 | SQLite schema and accessors. | [claude_docs/db.md](claude_docs/db.md) |
 | [profile.py](apply_engine/profile.py) | 73 | Loads `profile.yaml`, extracts resume text. | [claude_docs/profile.md](claude_docs/profile.md) |
 | [email_fetcher.py](apply_engine/email_fetcher.py) | 194 | IMAP poll for Greenhouse security codes. | [claude_docs/email_fetcher.md](claude_docs/email_fetcher.md) |
 | [config.py](apply_engine/config.py) | 16 | Paths, env vars, model name. | [claude_docs/config.md](claude_docs/config.md) |
@@ -65,7 +66,7 @@ Loaded from `.env` at repo root via `python-dotenv` in [config.py](apply_engine/
 
 ## CLI commands
 
-`apply init` · `apply <url>` (positional URL is auto-rewritten as `apply <url>`) · `apply dry-run <url>` · `apply review` · `apply edit <id>` · `apply confirm <id>` · `apply list` · `apply check-gmail` · `apply dashboard` (web UI on `127.0.0.1:8765`, requires `webui/dist/` — see [web.md](claude_docs/web.md)). Flags on `apply <url>`: `--headless`, `--no-submit`, `--manual-submit`, `--force` (re-apply a URL that's already been submitted). Re-applies of a URL with an existing `submitted` row are skipped automatically. Per-run artifacts (screenshots) land in `data/applications/<timestamp>_<company-slug>/` with paths recorded on the `applications` row. Details: [cli.md](claude_docs/cli.md).
+`apply init` · `apply <url>` (positional URL is auto-rewritten as `apply <url>`) · `apply bulk` (search my.greenhouse.io/dashboard and apply to N matches — see [bulk.md](claude_docs/bulk.md)) · `apply dry-run <url>` · `apply review` · `apply edit <id>` · `apply confirm <id>` · `apply list` · `apply check-gmail` · `apply dashboard` (web UI on `127.0.0.1:8765`, requires `webui/dist/` — see [web.md](claude_docs/web.md)). Flags on `apply <url>`: `--headless`, `--no-submit`, `--manual-submit`, `--force` (re-apply a URL that's already been submitted). Re-applies of a URL with an existing `submitted` row are skipped automatically. Per-run artifacts (screenshots) land in `data/applications/<timestamp>_<company-slug>/` with paths recorded on the `applications` row. Details: [cli.md](claude_docs/cli.md).
 
 ## Conventions
 

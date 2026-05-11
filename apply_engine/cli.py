@@ -50,6 +50,61 @@ def apply_cmd(
     )
 
 
+@app.command(name="bulk")
+def bulk_cmd(
+    title: str | None = typer.Option(None, "--title", "-t", help="Job title keyword (default: software)."),
+    location: str | None = typer.Option(None, "--location", "-l", help="Location filter (required)."),
+    count: int | None = typer.Option(None, "--count", "-n", help="Max number of jobs to apply to (default: 10)."),
+    headless: bool = typer.Option(False, "--headless"),
+    no_submit: bool = typer.Option(False, "--no-submit", help="Fill each form but don't submit."),
+    manual_submit: bool = typer.Option(
+        False, "--manual-submit",
+        help="Fill each form, then pause for you to click Submit.",
+    ),
+    list_only: bool = typer.Option(
+        False, "--list",
+        help="Print the candidate jobs found and exit without applying.",
+    ),
+) -> None:
+    """Search my.greenhouse.io/dashboard and bulk-apply to matching jobs.
+
+    Skips titles in profile.yaml `bulk_apply.skip_titles` and any URL already
+    submitted in the local DB. Requires that you've signed in to
+    my.greenhouse.io once in this persistent browser profile.
+    """
+    from .bulk import bulk_apply
+
+    profile = load_profile()
+
+    if title is None:
+        title = Prompt.ask("Job title keyword", default="software").strip() or "software"
+    if location is None:
+        location = Prompt.ask("Location (required)").strip()
+    if not location:
+        console.print("[red]Location is required.[/red]")
+        raise typer.Exit(1)
+    if count is None:
+        try:
+            count = int(Prompt.ask("How many jobs to apply to?", default="10"))
+        except ValueError:
+            console.print("[red]Count must be a number.[/red]")
+            raise typer.Exit(1)
+    if count <= 0:
+        console.print("[red]Count must be a positive number.[/red]")
+        raise typer.Exit(1)
+
+    bulk_apply(
+        profile,
+        title_keyword=title,
+        location=location,
+        count=count,
+        headless=headless,
+        submit=not no_submit,
+        manual_submit=manual_submit,
+        list_only=list_only,
+    )
+
+
 @app.command(name="dry-run")
 def dry_run_cmd(
     url: str = typer.Argument(..., help="Greenhouse application URL."),

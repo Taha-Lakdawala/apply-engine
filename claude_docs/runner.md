@@ -129,7 +129,6 @@ Greenhouse can require an emailed security code as a second step.
   - Click the input, clear it, **type** the code with `delay=70` (NOT `fill()`, which doesn't trigger React's per-keystroke `onChange` so the submit button stays disabled).
   - Press `Tab` (blur fires onBlur validation).
   - `page.wait_for_function` polls for the submit button to leave its disabled state, 10s timeout. On timeout: print "Code may have been rejected" but continue.
-  - Take another screenshot `app_dir / "recode_pre_submit.png"`.
   - Re-call `greenhouse.submit(page)` → updated status.
 
 #### Final status handling
@@ -230,6 +229,6 @@ Used in two places: phase 3 fill loop and the late/conditional fill loops. Same 
 - **Three separate places set `resolved[f.key] = ResolvedAnswer(value="", source="ai", question_id=qid, answer_id=0)`** for empty AI responses (phase 2, late, conditional). If you change the empty-cache behavior, update all three.
 - **`_wait_for_security_code` deletes `security_code.txt` at start.** Old codes don't bleed across runs.
 - **Cover-letter PDF uses Helvetica** which doesn't support non-Latin scripts. If the candidate name is non-ASCII, `ai._sanitize` doesn't catch it — the PDF render will fail.
-- **Screenshots live in per-application directories** at `data/applications/<YYYYMMDD-HHMMSS>_<company-slug>/{pre_submit,recode_pre_submit,post_submit}.png`. The directory and screenshot paths are persisted to the `applications` row as repo-relative strings. There's still no cleanup.
+- **Screenshots live in per-application directories** at `data/applications/<YYYYMMDD-HHMMSS>_<company-slug>/{pre_submit,post_submit}.png`. The directory and screenshot paths are persisted to the `applications` row as repo-relative strings. There's still no cleanup.
 - **The skip check is exact-string URL match.** If the same job is opened via a slightly different URL (extra query param, anchor), the duplicate detection misses. If URLs aren't stable, normalise before passing to `apply_to_url` (or just use `--force`).
 - **`greenhouse.has_recaptcha` exists** but isn't called anywhere in `runner.py`. If you want pre-flight reCAPTCHA detection, hook it in before submit.
