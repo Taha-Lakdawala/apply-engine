@@ -16,6 +16,7 @@ venv/
 
 # User data (never commit personal data)
 profile.yaml
+profile.yaml.bak.*
 data/
 resume.pdf
 resume.docx
@@ -26,6 +27,14 @@ resume.docx
 playwright-report/
 test-results/
 .playwright/
+
+# Frontend (webui)
+webui/node_modules/
+webui/.vite/
+*.tsbuildinfo
+# `dist/` above would catch webui/dist too — keep the built UI committed
+# so `apply dashboard` works without a node toolchain.
+!webui/dist/
 
 # Editor
 .vscode/

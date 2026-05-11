@@ -43,6 +43,7 @@ The app uses **Gemini** (`google-genai`). Default model `gemini-2.5-flash`, over
 | [profile.py](apply_engine/profile.py) | 73 | Loads `profile.yaml`, extracts resume text. | [claude_docs/profile.md](claude_docs/profile.md) |
 | [email_fetcher.py](apply_engine/email_fetcher.py) | 194 | IMAP poll for Greenhouse security codes. | [claude_docs/email_fetcher.md](claude_docs/email_fetcher.md) |
 | [config.py](apply_engine/config.py) | 16 | Paths, env vars, model name. | [claude_docs/config.md](claude_docs/config.md) |
+| [web/server.py](apply_engine/web/server.py) | — | FastAPI dashboard (read-only DB views + profile.yaml editor). React frontend in [webui/](webui/). | [claude_docs/web.md](claude_docs/web.md) |
 
 ## Cross-cutting facts
 
@@ -64,7 +65,7 @@ Loaded from `.env` at repo root via `python-dotenv` in [config.py](apply_engine/
 
 ## CLI commands
 
-`apply init` · `apply <url>` (positional URL is auto-rewritten as `apply <url>`) · `apply dry-run <url>` · `apply review` · `apply edit <id>` · `apply confirm <id>` · `apply list` · `apply check-gmail`. Flags on `apply <url>`: `--headless`, `--no-submit`, `--manual-submit`, `--force` (re-apply a URL that's already been submitted). Re-applies of a URL with an existing `submitted` row are skipped automatically. Per-run artifacts (screenshots) land in `data/applications/<timestamp>_<company-slug>/` with paths recorded on the `applications` row. Details: [cli.md](claude_docs/cli.md).
+`apply init` · `apply <url>` (positional URL is auto-rewritten as `apply <url>`) · `apply dry-run <url>` · `apply review` · `apply edit <id>` · `apply confirm <id>` · `apply list` · `apply check-gmail` · `apply dashboard` (web UI on `127.0.0.1:8765`, requires `webui/dist/` — see [web.md](claude_docs/web.md)). Flags on `apply <url>`: `--headless`, `--no-submit`, `--manual-submit`, `--force` (re-apply a URL that's already been submitted). Re-applies of a URL with an existing `submitted` row are skipped automatically. Per-run artifacts (screenshots) land in `data/applications/<timestamp>_<company-slug>/` with paths recorded on the `applications` row. Details: [cli.md](claude_docs/cli.md).
 
 ## Conventions
 

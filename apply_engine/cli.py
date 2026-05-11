@@ -174,6 +174,26 @@ def check_gmail_cmd() -> None:
         )
 
 
+@app.command()
+def dashboard(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8765, "--port"),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Don't auto-open the browser."),
+) -> None:
+    """Launch the web dashboard (profile editor, applications, Q&A history)."""
+    from .web import server
+
+    dist = config.ROOT / "webui" / "dist"
+    if not dist.exists():
+        console.print(
+            "[red]Frontend not built.[/red] Run:\n"
+            f"  cd {config.ROOT}/webui && npm install && npm run build"
+        )
+        raise typer.Exit(1)
+    console.print(f"[green]Dashboard:[/green] http://{host}:{port}")
+    server.run(host=host, port=port, open_browser=not no_browser)
+
+
 @app.command(name="list")
 def list_cmd() -> None:
     """List every stored question and its current answer."""
