@@ -1,6 +1,6 @@
 # resolver.py — deep-dive
 
-Deterministic answer resolution: preset → profile lookup → salary PPP → optional-website skip → stored answer. Decides what reaches the AI.
+Deterministic answer resolution: preset → profile lookup → salary PPP → ambiguous-date skip → stored answer. Decides what reaches the AI.
 
 > **Self-update reminder:** edit this doc whenever you change the resolution order, add a new branch in `try_known_resolve`, modify `PROFILE_MAPPINGS`, change the salary table, or alter `normalize_question`. The resolution-order summary in [../CLAUDE.md](../CLAUDE.md) is intentionally one line — only update it if a *new branch* is added or removed.
 
@@ -27,20 +27,18 @@ Resolution order inside the function (each step that matches **also inserts an a
 
 2. **Profile lookup** — `_profile_lookup(field.question, profile, field.required)` walks `PROFILE_MAPPINGS` (regex → dotted profile path) and synthesises `Full Name` from first+last when needed.
    - **Constraint check for select fields:** if `field.options` is non-empty AND the looked-up value isn't an exact (case-insensitive) match for one of the options, the value is discarded and resolution falls through. This is why "Country" → `location.country` only fires if the country dropdown contains the exact string.
-   - **Optional website skip:** if the matched path is `links.website` and `field.required` is False, returns `None` (don't volunteer a personal site on forms that don't ask for it).
+   - **Website fallback to LinkedIn:** if the matched path is `links.website` and that profile slot is empty, the lookup falls back to `links.linkedin`. Always fills website fields (no `required` gate) because Greenhouse commonly marks website as optional in HTML but rejects empty values server-side.
    - On accept, inserts answer with `source="profile"`.
 
 3. **Salary** — `_is_salary_question(field.question)` runs `_SALARY_RE` against the normalized question. If matched:
    - **Free-text field** (no options, not a select-type): `_compute_salary(job_location)` returns a deterministic range string. On match, inserts and returns `source="preset"`. If the location doesn't match any country in `_PPP_TABLE`, falls through to stored/AI.
    - **Select / searchable_select / has options:** **returns `(question_id, None)` immediately**, bypassing stored answers. AI must pick from the dropdown options because the deterministic value won't match exactly.
 
-4. **Optional-website short-circuit** — if `not field.required` and the question matches `_WEBSITE_RE` (`^(personal\s*)?website$|portfolio`), returns `(question_id, None)` *before* the stored-answer step. Stops a value previously stored when the same question was required on another form from resurfacing on optional ones. The AI's system prompt also forbids filling website on optional fields, so the field ends up empty.
+4. **Ambiguous date short-circuit** — if the normalized fingerprint matches `_AMBIGUOUS_DATE_RE` (`^(start|end)\s+(date\s+)?(year|month)$`), returns `(question_id, None)` to skip stored. These bare labels appear in BOTH education and employment sections of Greenhouse forms; reusing a stored value would leak one section's date into the other. AI is the only consumer that gets `form_order` context to disambiguate, so we always route these through the batch.
 
-5. **Ambiguous date short-circuit** — if the normalized fingerprint matches `_AMBIGUOUS_DATE_RE` (`^(start|end)\s+(date\s+)?(year|month)$`), returns `(question_id, None)` to skip stored. These bare labels appear in BOTH education and employment sections of Greenhouse forms; reusing a stored value would leak one section's date into the other. AI is the only consumer that gets `form_order` context to disambiguate, so we always route these through the batch.
+5. **Stored** — `db.latest_answer(conn, question.id)`. If present, returns `source="stored"`. The answer's `value` is reused as-is.
 
-6. **Stored** — `db.latest_answer(conn, question.id)`. If present, returns `source="stored"`. The answer's `value` is reused as-is.
-
-7. Otherwise returns `(question_id, None)` → AI.
+6. Otherwise returns `(question_id, None)` → AI.
 
 The whole function runs inside one `with db.connect() as conn:` block.
 
@@ -150,10 +148,6 @@ Case-insensitive exact match against any option in the list. Used to gate the pr
 
 `bool(_SALARY_RE.search(normalize_question(question)))`.
 
-### `_is_website_question(question) -> bool`
-
-`bool(_WEBSITE_RE.search(normalize_question(question)))`. Used to short-circuit resolution for optional website/portfolio fields before the stored-answer step.
-
 ## Common edits
 
 - **Map a new question label to a profile field:** add a `(regex, "dotted.path")` tuple to `PROFILE_MAPPINGS`. Match against the **normalized** form (lowercased, alphanumeric+space only).
@@ -167,7 +161,7 @@ Case-insensitive exact match against any option in the list. Used to gate the pr
 - **`normalize_question` changes break the DB.** Same input → different fingerprint → answers don't reuse. Treat changes as a migration.
 - **Profile lookup is gated by option matching for select fields.** If the user's `location.country` is `"India"` but the dropdown has `"India (Republic)"`, the lookup falls through. AI sees the dropdown options and picks correctly.
 - **Salary on select fields skips the stored cache too.** Logic at `is_select_type` branch returns `None` directly so AI re-picks every time. This is intentional — different forms have different option sets.
-- **Optional `website` / `portfolio` fields are intentionally left blank.** Both the profile-lookup branch and the stored-answer branch are gated on `field.required`. The AI system prompt also forbids volunteering a website on optional fields, so the value ends up empty in the form. To force-fill anyway, mark the field required upstream or add an entry to `preset_answers:` (preset wins over the gate).
+- **Website fields always get filled, regardless of `required`.** `_profile_lookup` returns `links.website` for every website question — and falls back to `links.linkedin` if the website slot is empty. The previous "only fill when required" gate was removed because Greenhouse routinely marks website as optional in HTML but rejects empty values server-side. The AI prompt still says "leave website blank when optional", but the resolver fills before AI is consulted, so that branch is no longer reachable.
 - **`PROFILE_MAPPINGS` is regex-on-normalized-text.** `[^a-z0-9 ]+` is collapsed to space, so don't put punctuation in your regex (it'll never match).
 - **Generic year labels intentionally fall through to AI.** Greenhouse forms reuse the labels "Start date year" / "End date year" in BOTH the education and employment sections, and the resolver sees one field at a time so it can't tell them apart. The education-year regex requires `\beducation\b` in the label; everything else (including bare "Start date year" in an employment block) falls through to the AI batch which gets `form_order` context and can pick the correct section. If you re-add a generic year regex here, an employment date field will silently inherit the candidate's graduation year.
 - **Bare Start/End date year/month also skip the stored-answer step.** `_AMBIGUOUS_DATE_RE` short-circuits between the optional-website check and the stored lookup. Without that, after one run stored "End date year" → "2021" (the candidate's grad year), the *employment* End-date-year field on the next form would silently inherit it instead of going to the AI batch — which knows the most-recent employer is current and would return "2026". Don't remove this short-circuit unless the resolver gains form_order context too.

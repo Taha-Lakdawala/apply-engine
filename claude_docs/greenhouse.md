@@ -381,13 +381,15 @@ True if the trigger reports `aria-expanded="true"` OR there is a visible non-iti
 5. **Fallback:** if the value isn't found OR didn't commit, try `"Other"` (and re-verify).
 6. **Final fallback:** Escape + raise `ValueError`.
 
-### `_type_and_pick(page, selector, value) -> None`
+### `_type_and_pick(page, selector, value, fallbacks=None) -> None`
 
-For long-list comboboxes (countries, cities, university lists). Open via `_open_combobox_trigger`, clear, `press_sequentially(value, delay=60)`. Then **passively poll** for the dropdown to populate via `_wait_for_dropdown_options` (read-only — does not call `_click_visible_option` in a loop). When at least one `[role="option"]` is visible, click the best match once; verify commit via `_trigger_looks_unselected`.
+For long-list comboboxes (countries, cities, university lists, industry pickers). Open via `_open_combobox_trigger`, clear, `press_sequentially(value, delay=60)`. Then **passively poll** for the dropdown to populate via `_wait_for_dropdown_options` (read-only — does not call `_click_visible_option` in a loop). When at least one `[role="option"]` is visible, click the best match once; verify commit via `_trigger_looks_unselected`.
 
 Why no poll-clicking: repeatedly calling `_click_visible_option` against an empty react-select dropdown nudges its internal "no options" state in ways that break a later "Other" fallback (the dropdown stops re-populating on subsequent typing). A single click attempt against a confirmed-populated dropdown is reliable.
 
-On miss: clear input, ensure the dropdown is still open (re-call `_open_combobox_trigger` if not), type `"Other"`, wait for population, click once. Raises `ValueError` if nothing matched.
+On miss: walk a list of fallback values in order, then finally type `"Other"`. Each attempt clears the input, re-opens the trigger if it closed, types, waits for options, clicks once, verifies commit. Raises `ValueError` if nothing matched.
+
+`fallbacks` is used by the `searchable_select` branch of `fill_field` for fields like "Current Industry" where the AI's verbose answer ("Information Technology and Services") rarely matches the canonical dropdown options. See `_INDUSTRY_FALLBACKS` and `_is_industry_field` near `_type_and_pick`.
 
 ### `_wait_for_dropdown_options(page, timeout_ms) -> int`
 

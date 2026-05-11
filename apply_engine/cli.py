@@ -37,10 +37,17 @@ def apply_cmd(
         False, "--manual-submit",
         help="Fill the form, then pause for you to click Submit. Recommended for captcha-protected forms.",
     ),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Re-apply even if a prior successful submission exists for this URL.",
+    ),
 ) -> None:
     """Fill out and submit a Greenhouse application."""
     profile = load_profile()
-    apply_to_url(url, profile, headless=headless, submit=not no_submit, manual_submit=manual_submit)
+    apply_to_url(
+        url, profile,
+        headless=headless, submit=not no_submit, manual_submit=manual_submit, force=force,
+    )
 
 
 @app.command(name="dry-run")

@@ -35,10 +35,11 @@ def apply_cmd(
     headless: bool = False,           # --headless
     no_submit: bool = False,          # --no-submit
     manual_submit: bool = False,      # --manual-submit
+    force: bool = False,              # --force
 )
 ```
 
-Loads the profile, then calls `runner.apply_to_url(url, profile, headless=..., submit=not no_submit, manual_submit=...)`. The positional-URL shortcut is implemented in `main()` (see below).
+Loads the profile, then calls `runner.apply_to_url(url, profile, headless=..., submit=not no_submit, manual_submit=..., force=force)`. The positional-URL shortcut is implemented in `main()` (see below). `--force` overrides the runner's re-apply guard (which otherwise skips URLs that already have a `submitted` row in the `applications` table).
 
 ### `dry-run`
 

@@ -1227,7 +1227,8 @@ def fill_field(page: Page, field: Field, value: str, resume_path: Path | None = 
             loc.fill("")
             _fill_location(page, loc, value)
             return
-        _type_and_pick(page, selector, value)
+        fallbacks = _INDUSTRY_FALLBACKS if _is_industry_field(field) else None
+        _type_and_pick(page, selector, value, fallbacks=fallbacks)
         return
 
     if field.type == "multiselect":
@@ -1585,7 +1586,12 @@ def _wait_for_dropdown_options(page: Page, timeout_ms: int) -> int:
     return 0
 
 
-def _type_and_pick(page: Page, selector: str, value: str) -> None:
+def _type_and_pick(
+    page: Page,
+    selector: str,
+    value: str,
+    fallbacks: list[str] | None = None,
+) -> None:
     """For long-list comboboxes (countries / city autocompletes): focus, type, wait
     for the dropdown to populate (server-side filtering races the click), then click
     the best match.
@@ -1594,31 +1600,54 @@ def _type_and_pick(page: Page, selector: str, value: str) -> None:
     calling ``_click_visible_option`` against an empty dropdown nudges react-select's
     internal state in ways that break a later "Other" fallback (the dropdown stops
     re-populating on subsequent typing). One click attempt per typed value is enough
-    when we've already confirmed options are present."""
+    when we've already confirmed options are present.
+
+    ``fallbacks``: ordered alternates to try if the primary value doesn't match (e.g.
+    industry synonyms). All fallbacks are tried before the generic "Other" fallback."""
     _open_combobox_trigger(page, selector)
     loc = page.locator(selector).first
-    loc.fill("")
-    loc.press_sequentially(value, delay=60)
-    if _wait_for_dropdown_options(page, 3000) > 0:
-        if _click_visible_option(page, value):
-            page.wait_for_timeout(200)
-            if not _trigger_looks_unselected(page, selector):
-                return
-    # Value not in dropdown (or no options came back) — clear and try "Other" as fallback
-    # (e.g. unlisted schools). Re-open the trigger so react-select rebuilds the list:
-    # an empty input + clearing alone sometimes leaves the dropdown collapsed after a
-    # zero-results state.
-    loc.fill("")
-    page.wait_for_timeout(200)
-    if not _combobox_is_open(page, selector):
-        _open_combobox_trigger(page, selector)
-    loc.press_sequentially("Other", delay=60)
-    if _wait_for_dropdown_options(page, 2000) > 0:
-        if _click_visible_option(page, "Other"):
-            page.wait_for_timeout(200)
-            if not _trigger_looks_unselected(page, selector):
-                return
-    raise ValueError(f"No combobox option matched {value!r} after typing")
+
+    def _try(candidate: str, wait_ms: int) -> bool:
+        loc.fill("")
+        page.wait_for_timeout(200)
+        if not _combobox_is_open(page, selector):
+            _open_combobox_trigger(page, selector)
+        loc.press_sequentially(candidate, delay=60)
+        if _wait_for_dropdown_options(page, wait_ms) > 0:
+            if _click_visible_option(page, candidate):
+                page.wait_for_timeout(200)
+                if not _trigger_looks_unselected(page, selector):
+                    return True
+        return False
+
+    if _try(value, 3000):
+        return
+    for fb in (fallbacks or []):
+        if _try(fb, 2000):
+            return
+    if _try("Other", 2000):
+        return
+    fb_msg = f" or fallbacks {fallbacks!r}" if fallbacks else ""
+    raise ValueError(f"No combobox option matched {value!r}{fb_msg} after typing")
+
+
+# Greenhouse "Current Industry" pickers list canonical industry names which often
+# don't match the verbose AI suggestion ("Information Technology and Services").
+# Try common synonyms before falling back to Financial Services (LSEG's industry).
+_INDUSTRY_FALLBACKS: list[str] = [
+    "Information Technology",
+    "IT Services",
+    "Software",
+    "Computer Software",
+    "Technology",
+    "IT",
+    "Financial Services",
+    "Finance",
+]
+
+
+def _is_industry_field(field: "Field") -> bool:
+    return bool(re.search(r"\bindustry\b", field.label, re.I))
 
 
 def _is_location_field(field: "Field") -> bool:

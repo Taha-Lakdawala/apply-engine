@@ -6,9 +6,11 @@
 
 ## Public surface
 
-### `apply_to_url(url, profile, *, headless=False, submit=True, manual_submit=False) -> RunReport`
+### `apply_to_url(url, profile, *, headless=False, submit=True, manual_submit=False, force=False) -> RunReport`
 
 Single application end-to-end. Called by `cli.apply_cmd`. All keyword args after `url`/`profile`. Returns a populated `RunReport`.
+
+**Re-apply guard:** unless `force=True`, the function first calls `db.find_successful_application(conn, url)`. If a prior `submitted` row exists for this exact URL, it prints a yellow notice and returns an otherwise-empty `RunReport` (no browser launched, no fields filled). The CLI exposes this as `--force`.
 
 ### `FillResult` (dataclass)
 
@@ -45,8 +47,10 @@ The CLI only prints to console; the report exists for programmatic callers and t
 
 ### Init
 - `db.init_db()` (idempotent).
-- `greenhouse.with_browser(headless=...)` returns `(pw, None, page_factory, cleanup)`. The second slot is `None` because we use a `launch_persistent_context` (no separate browser handle).
 - Create `RunReport(url=url, company=None, job_title=None)`.
+- **Re-apply guard:** unless `force=True`, query `db.find_successful_application(conn, url)`. On hit, print a skip notice and return the (mostly-empty) report. The browser is never launched in this branch.
+- `greenhouse.with_browser(headless=...)` returns `(pw, None, page_factory, cleanup)`. The second slot is `None` because we use a `launch_persistent_context` (no separate browser handle).
+- After `open_application` returns `meta`, build `app_dir = _make_app_dir(meta.company, meta.title)` — a per-run directory under `data/applications/<YYYYMMDD-HHMMSS>_<company-slug>/`. All screenshots from this run land here.
 
 ### Phase 1 — extract + deterministic resolution
 - `greenhouse.open_application(page_factory, url)` — see [greenhouse.md](greenhouse.md#open_application). Returns `(page, fields, meta)`. Sets `report.company`, `report.job_title`.
@@ -112,7 +116,7 @@ Two short-circuits first:
 - `if not submit:` → print "Skipping submit (--no-submit)".
 
 Otherwise:
-1. Take a `pre_submit_<unix>.png` full-page screenshot to `data/`.
+1. Take a full-page screenshot to `app_dir / "pre_submit.png"`. On success the path is captured into `pre_submit_path` and later persisted to the DB.
 2. `page.wait_for_timeout(800)`.
 3. `status = greenhouse.submit(page)` → `"verified"` | `"code_required"` | `"blocked"` | `"invalid"` | `"unverified"`.
 
@@ -125,12 +129,12 @@ Greenhouse can require an emailed security code as a second step.
   - Click the input, clear it, **type** the code with `delay=70` (NOT `fill()`, which doesn't trigger React's per-keystroke `onChange` so the submit button stays disabled).
   - Press `Tab` (blur fires onBlur validation).
   - `page.wait_for_function` polls for the submit button to leave its disabled state, 10s timeout. On timeout: print "Code may have been rejected" but continue.
-  - Take another screenshot `submit_pre_<unix>.png`.
+  - Take another screenshot `app_dir / "recode_pre_submit.png"`.
   - Re-call `greenhouse.submit(page)` → updated status.
 
 #### Final status handling
 
-After whatever submit attempts, take a `submit_<unix>.png` screenshot and log the post-submit URL + first 300 chars of body text to console (debug output for unknown states).
+After whatever submit attempts, take `app_dir / "post_submit.png"` (captured into `post_submit_path` on success) and log the post-submit URL + first 300 chars of body text to console (debug output for unknown states).
 
 Branch on status:
 - `"verified"` → `report.submitted = True`, green "Submitted (verified)".
@@ -145,13 +149,17 @@ Then `page.wait_for_timeout(3000)`.
 
 Inside `with db.connect() as conn:`:
 - Determine `final_status`: `"submitted"` if `report.submitted`, `"failed"` if `report.error`, else `"filled"`.
-- `db.record_application(conn, url=url, company=meta.company, job_title=meta.title, status=final_status, error=report.error)`.
+- `db.record_application(conn, url=url, company=meta.company, job_title=meta.title, status=final_status, error=report.error, screenshots_dir=_rel(app_dir), pre_submit_screenshot=_rel(pre_submit_path), post_submit_screenshot=_rel(post_submit_path))`.
+
+The `_rel` helper converts paths to repo-relative strings (or returns `None` if the path is `None`). `app_dir` is set whenever `open_application` succeeded; the screenshot paths are set only when the screenshot was successfully written.
 
 ### Exception handling
 
 The whole body is wrapped in `try ... except Exception as e:`:
 - Sets `report.error = str(e)`, prints "[red]Error: {e}[/red]".
 - Records a `status="failed"` application row with the error.
+
+In the `except` branch, `db.record_application` is still called with the same screenshot paths (any that were captured before the exception). `app_dir` may be `None` if the exception happened before `open_application` returned — `_rel(None)` returns `None`.
 
 `finally` always calls `cleanup()` to close the browser.
 
@@ -174,6 +182,18 @@ Logs codes as `XX***YY` (or `X***Y` for short codes). Used in the IMAP success m
 ### `_truncate(s, n=70) -> str`
 
 Console-display truncation for `FillResult` value lines (newlines→spaces, ellipsis if longer).
+
+### `_slug(s) -> str`
+
+Lowercase + replace non-alphanumerics with `-` + collapse + strip. Truncated to 50 chars. Empty string → `"unknown"`. Used to build the per-application directory name from company/title.
+
+### `_make_app_dir(company, title) -> Path`
+
+Builds `data/applications/<YYYYMMDD-HHMMSS>_<slug>/` (timestamp via `datetime.now()` — local time), `mkdir(parents=True, exist_ok=True)`, returns the Path. Called once per run, after `open_application` returns `meta`. Slug prefers `company`, falls back to `title`, falls back to `"unknown"`.
+
+### `_rel(p) -> str | None`
+
+Converts a Path to a string relative to `config.ROOT`. Returns `None` for `None`. Falls back to `str(p)` if the path isn't under the repo root (shouldn't happen for our paths but doesn't blow up). Used by `record_application` to keep DB rows portable across machine moves.
 
 ### `_write_cover_letter_pdf(text, path) -> None`
 
@@ -210,5 +230,6 @@ Used in two places: phase 3 fill loop and the late/conditional fill loops. Same 
 - **Three separate places set `resolved[f.key] = ResolvedAnswer(value="", source="ai", question_id=qid, answer_id=0)`** for empty AI responses (phase 2, late, conditional). If you change the empty-cache behavior, update all three.
 - **`_wait_for_security_code` deletes `security_code.txt` at start.** Old codes don't bleed across runs.
 - **Cover-letter PDF uses Helvetica** which doesn't support non-Latin scripts. If the candidate name is non-ASCII, `ai._sanitize` doesn't catch it — the PDF render will fail.
-- **The screenshots all live in `data/`** with `unix_timestamp` in the name. They accumulate over time. There's no cleanup.
+- **Screenshots live in per-application directories** at `data/applications/<YYYYMMDD-HHMMSS>_<company-slug>/{pre_submit,recode_pre_submit,post_submit}.png`. The directory and screenshot paths are persisted to the `applications` row as repo-relative strings. There's still no cleanup.
+- **The skip check is exact-string URL match.** If the same job is opened via a slightly different URL (extra query param, anchor), the duplicate detection misses. If URLs aren't stable, normalise before passing to `apply_to_url` (or just use `--force`).
 - **`greenhouse.has_recaptcha` exists** but isn't called anywhere in `runner.py`. If you want pre-flight reCAPTCHA detection, hook it in before submit.

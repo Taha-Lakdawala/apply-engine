@@ -33,16 +33,23 @@ CREATE INDEX idx_answers_question_created
     ON answers(question_id, created_at DESC);
 
 CREATE TABLE applications (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    url             TEXT NOT NULL,
-    company         TEXT,
-    job_title       TEXT,
-    status          TEXT NOT NULL,           -- 'submitted', 'filled', 'failed'
-    submitted_at    TEXT,                    -- only set when status = 'submitted'
-    created_at      TEXT NOT NULL,
-    error           TEXT
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    url                     TEXT NOT NULL,
+    company                 TEXT,
+    job_title               TEXT,
+    status                  TEXT NOT NULL,   -- 'submitted', 'filled', 'failed'
+    submitted_at            TEXT,            -- only set when status = 'submitted'
+    created_at              TEXT NOT NULL,
+    error                   TEXT,
+    screenshots_dir         TEXT,            -- repo-relative path to data/applications/<run>/
+    pre_submit_screenshot   TEXT,            -- repo-relative path to pre_submit.png
+    post_submit_screenshot  TEXT             -- repo-relative path to post_submit.png
 );
+
+CREATE INDEX idx_applications_url_status ON applications(url, status);
 ```
+
+`screenshots_dir` is set whenever a per-application directory was created (i.e., the page opened successfully). The screenshot path columns are set only when the corresponding screenshot was successfully written. All three paths are stored relative to the repo root via `runner._rel`.
 
 ### Key contract: `fingerprint`
 
@@ -122,9 +129,13 @@ Sets `reviewed_at = _now()` on the given answer.
 
 **Inserts a new row** marked `ai_generated=0` and `reviewed_at=<now>`. This is "the user manually fixed this answer" — it supersedes any AI answer for this question on next read because `latest_answer` orders by `created_at DESC`.
 
-### `record_application(conn, url, company, job_title, status, error=None) -> int`
+### `record_application(conn, url, company, job_title, status, error=None, screenshots_dir=None, pre_submit_screenshot=None, post_submit_screenshot=None) -> int`
 
-Inserts into `applications`. `submitted_at` only set when `status == 'submitted'`. Status values used elsewhere: `submitted` | `filled` | `failed` (set by `runner.apply_to_url`).
+Inserts into `applications`. `submitted_at` only set when `status == 'submitted'`. Status values used elsewhere: `submitted` | `filled` | `failed` (set by `runner.apply_to_url`). The three path columns are repo-relative paths supplied by the runner; pass `None` when no screenshot was taken.
+
+### `find_successful_application(conn, url) -> sqlite3.Row | None`
+
+Most recent `applications` row with this exact `url` and `status = 'submitted'`. Returns the raw `sqlite3.Row` (not a dataclass — these fields aren't otherwise exposed). Used by `runner.apply_to_url` to short-circuit re-applies; `--force` on the CLI skips this check. **Exact URL match — no normalisation.** Query strings and anchors count; if Greenhouse URLs ever vary across visits to the same job, this will fail to detect a duplicate.
 
 ## Common edits
 
@@ -135,7 +146,7 @@ Inserts into `applications`. `submitted_at` only set when `status == 'submitted'
 
 ## Gotchas
 
-- **No migration system.** Schema changes only apply to fresh DBs. If you add a column, document the manual ALTER in this section.
+- **Minimal migration system.** `init_db()` runs the `CREATE TABLE IF NOT EXISTS` script, then for each entry in `_APPLICATIONS_MIGRATIONS` runs an `ALTER TABLE applications ADD COLUMN`, swallowing the `OperationalError` when the column already exists. Only `applications` has migrations wired up today. If you add a column to `questions` or `answers`, extend the migration list (or add a parallel one) — otherwise existing DBs won't get it.
 - **`connect()` doesn't rollback on exceptions.** A function that does multiple writes and raises will leave partial state. Most accessors do single writes so this rarely matters in practice.
 - **`upsert_question` ignores incoming `field_type`/`options` on conflict.** If a question's options change between applications (rare — Greenhouse forms tend to be stable), the stored options stay outdated. Probably not worth fixing unless a real bug surfaces.
 - **`raw_text` on the Question row is whatever was first inserted.** If two applications phrase the same fingerprint slightly differently, you'll keep the first phrasing.

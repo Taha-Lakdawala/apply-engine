@@ -64,7 +64,7 @@ Loaded from `.env` at repo root via `python-dotenv` in [config.py](apply_engine/
 
 ## CLI commands
 
-`apply init` · `apply <url>` (positional URL is auto-rewritten as `apply <url>`) · `apply dry-run <url>` · `apply review` · `apply edit <id>` · `apply confirm <id>` · `apply list` · `apply check-gmail`. Flags on `apply <url>`: `--headless`, `--no-submit`, `--manual-submit`. Details: [cli.md](claude_docs/cli.md).
+`apply init` · `apply <url>` (positional URL is auto-rewritten as `apply <url>`) · `apply dry-run <url>` · `apply review` · `apply edit <id>` · `apply confirm <id>` · `apply list` · `apply check-gmail`. Flags on `apply <url>`: `--headless`, `--no-submit`, `--manual-submit`, `--force` (re-apply a URL that's already been submitted). Re-applies of a URL with an existing `submitted` row are skipped automatically. Per-run artifacts (screenshots) land in `data/applications/<timestamp>_<company-slug>/` with paths recorded on the `applications` row. Details: [cli.md](claude_docs/cli.md).
 
 ## Conventions
 

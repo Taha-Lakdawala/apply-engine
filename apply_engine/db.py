@@ -34,16 +34,31 @@ CREATE INDEX IF NOT EXISTS idx_answers_question_created
     ON answers(question_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS applications (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    url             TEXT NOT NULL,
-    company         TEXT,
-    job_title       TEXT,
-    status          TEXT NOT NULL,
-    submitted_at    TEXT,
-    created_at      TEXT NOT NULL,
-    error           TEXT
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    url                     TEXT NOT NULL,
+    company                 TEXT,
+    job_title               TEXT,
+    status                  TEXT NOT NULL,
+    submitted_at            TEXT,
+    created_at              TEXT NOT NULL,
+    error                   TEXT,
+    screenshots_dir         TEXT,
+    pre_submit_screenshot   TEXT,
+    post_submit_screenshot  TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_applications_url_status
+    ON applications(url, status);
 """
+
+# Columns added after the initial schema. `init_db` ALTERs existing DBs to add
+# any that are missing — sqlite has no IF NOT EXISTS for ADD COLUMN, so we
+# swallow OperationalError when the column is already present.
+_APPLICATIONS_MIGRATIONS = [
+    ("screenshots_dir", "TEXT"),
+    ("pre_submit_screenshot", "TEXT"),
+    ("post_submit_screenshot", "TEXT"),
+]
 
 
 @dataclass
@@ -84,6 +99,11 @@ def connect() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        for col, decl in _APPLICATIONS_MIGRATIONS:
+            try:
+                conn.execute(f"ALTER TABLE applications ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError:
+                pass
 
 
 def upsert_question(
@@ -245,11 +265,36 @@ def record_application(
     job_title: str | None,
     status: str,
     error: str | None = None,
+    screenshots_dir: str | None = None,
+    pre_submit_screenshot: str | None = None,
+    post_submit_screenshot: str | None = None,
 ) -> int:
     submitted_at = _now() if status == "submitted" else None
     cur = conn.execute(
-        """INSERT INTO applications (url, company, job_title, status, submitted_at, created_at, error)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (url, company, job_title, status, submitted_at, _now(), error),
+        """INSERT INTO applications (
+                url, company, job_title, status, submitted_at, created_at, error,
+                screenshots_dir, pre_submit_screenshot, post_submit_screenshot
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            url, company, job_title, status, submitted_at, _now(), error,
+            screenshots_dir, pre_submit_screenshot, post_submit_screenshot,
+        ),
     )
     return cur.lastrowid
+
+
+def find_successful_application(
+    conn: sqlite3.Connection, url: str
+) -> sqlite3.Row | None:
+    """Most recent submitted application for `url`, or None.
+
+    Used by the runner to short-circuit re-applies. Exact URL match; no
+    normalisation — query strings/anchors matter."""
+    return conn.execute(
+        """SELECT id, url, company, job_title, submitted_at,
+                  screenshots_dir, pre_submit_screenshot, post_submit_screenshot
+             FROM applications
+            WHERE url = ? AND status = 'submitted'
+            ORDER BY id DESC LIMIT 1""",
+        (url,),
+    ).fetchone()

@@ -26,8 +26,6 @@ _INDIA_LOC_RE = re.compile(
     re.I,
 )
 
-_WEBSITE_RE = re.compile(r"^(personal\s*)?website$|portfolio")
-
 # Generic Start/End date year/month labels appear in BOTH education and employment
 # sections of Greenhouse forms (the runner sees one field at a time, so a stored
 # answer would leak the wrong section's value into the new section). The label
@@ -129,11 +127,13 @@ def _profile_lookup(question: str, profile: Profile, required: bool) -> str | No
     for pattern, path in PROFILE_MAPPINGS:
         if not re.search(pattern, norm):
             continue
-        # Personal website / portfolio is noise on most applications — only fill
-        # when the form actually requires it.
-        if path == "links.website" and not required:
-            return None
-        value = _resolve_path(profile.data, path)
+        if path == "links.website":
+            # Greenhouse commonly marks website as optional in the HTML but
+            # rejects empty values server-side. Always fill with the profile's
+            # website, falling back to LinkedIn if the website slot is empty.
+            value = _resolve_path(profile.data, path) or _resolve_path(profile.data, "links.linkedin")
+        else:
+            value = _resolve_path(profile.data, path)
         if value:
             return str(value).strip()
     # Synthesize "Full Name" from first + last
@@ -159,10 +159,6 @@ def _resolve_path(data: dict[str, Any], path: str) -> Any:
 
 def _is_salary_question(question: str) -> bool:
     return bool(_SALARY_RE.search(normalize_question(question)))
-
-
-def _is_website_question(question: str) -> bool:
-    return bool(_WEBSITE_RE.search(normalize_question(question)))
 
 
 def try_known_resolve(
@@ -212,13 +208,6 @@ def try_known_resolve(
                 # Unknown country, free-text field — fall through to stored/AI below
             else:
                 return question.id, None  # AI will pick from dropdown options
-
-        # Optional website fields short-circuit to None — the stored answer might
-        # be a value we filled when this same question was required on a prior form,
-        # and we don't want it resurfacing on optional ones. AI also gets told to
-        # leave it blank in that case.
-        if not field.required and _is_website_question(field.question):
-            return question.id, None
 
         # Generic Start/End date labels are ambiguous (education vs employment).
         # Skip stored to let the AI batch pick per-section via form_order.

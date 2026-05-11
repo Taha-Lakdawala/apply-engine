@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from rich.console import Console
 
@@ -42,15 +44,34 @@ def apply_to_url(
     headless: bool = False,
     submit: bool = True,
     manual_submit: bool = False,
+    force: bool = False,
 ) -> RunReport:
     db.init_db()
-    pw, browser, page_factory, cleanup = greenhouse.with_browser(headless=headless)
     report = RunReport(url=url, company=None, job_title=None)
+
+    if not force:
+        with db.connect() as conn:
+            prior = db.find_successful_application(conn, url)
+        if prior:
+            report.company = prior["company"]
+            report.job_title = prior["job_title"]
+            console.print(
+                f"[yellow]Already submitted this URL on {prior['submitted_at']} "
+                f"(application #{prior['id']}). Skipping.[/yellow]\n"
+                f"[dim]Pass --force to re-apply.[/dim]"
+            )
+            return report
+
+    pw, browser, page_factory, cleanup = greenhouse.with_browser(headless=headless)
+    app_dir: Path | None = None
+    pre_submit_path: Path | None = None
+    post_submit_path: Path | None = None
 
     try:
         page, fields, meta = greenhouse.open_application(page_factory, url)
         report.company = meta.company
         report.job_title = meta.title
+        app_dir = _make_app_dir(meta.company, meta.title)
 
         # Re-order fields by their actual DOM Y-position. The extractor produces
         # comboboxes first (DOM-order within that group), then standard inputs
@@ -273,9 +294,10 @@ def apply_to_url(
             report.error = "no application fields detected"
         elif submit:
             # Pre-submit screenshot: helps diagnose unfilled fields or validation state
-            pre_shot = config.DATA_DIR / f"pre_submit_{int(time.time())}.png"
+            pre_shot = app_dir / "pre_submit.png"
             try:
                 page.screenshot(path=str(pre_shot), full_page=True)
+                pre_submit_path = pre_shot
                 console.print(f"[dim]Pre-submit screenshot: {pre_shot}[/dim]")
             except Exception:
                 pass
@@ -317,7 +339,7 @@ def apply_to_url(
                             )
 
                         # Snapshot before clicking, in case it errors again
-                        snap = config.DATA_DIR / f"submit_pre_{int(time.time())}.png"
+                        snap = app_dir / "recode_pre_submit.png"
                         try:
                             page.screenshot(path=str(snap), full_page=True)
                             console.print(f"[dim]Pre-final-submit screenshot: {snap}[/dim]")
@@ -328,9 +350,10 @@ def apply_to_url(
                         status = greenhouse.submit(page)
 
             # Post-submit screenshot — taken after wait_for_function settles
-            shot_path = config.DATA_DIR / f"submit_{int(time.time())}.png"
+            shot_path = app_dir / "post_submit.png"
             try:
                 page.screenshot(path=str(shot_path), full_page=True)
+                post_submit_path = shot_path
                 console.print(f"[dim]Post-submit screenshot: {shot_path}[/dim]")
             except Exception:
                 pass
@@ -397,6 +420,9 @@ def apply_to_url(
                 job_title=meta.title,
                 status=final_status,
                 error=report.error,
+                screenshots_dir=_rel(app_dir),
+                pre_submit_screenshot=_rel(pre_submit_path),
+                post_submit_screenshot=_rel(post_submit_path),
             )
     except Exception as e:
         report.error = str(e)
@@ -409,6 +435,9 @@ def apply_to_url(
                 job_title=report.job_title,
                 status="failed",
                 error=str(e),
+                screenshots_dir=_rel(app_dir),
+                pre_submit_screenshot=_rel(pre_submit_path),
+                post_submit_screenshot=_rel(post_submit_path),
             )
     finally:
         cleanup()
@@ -483,6 +512,29 @@ def _redact(code: str) -> str:
     if len(code) <= 4:
         return code[0] + "***" + code[-1]
     return code[:2] + "***" + code[-2:]
+
+
+def _slug(s: str | None) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", (s or "").lower()).strip("-")
+    return (cleaned[:50] or "unknown")
+
+
+def _make_app_dir(company: str | None, title: str | None) -> Path:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    name = f"{ts}_{_slug(company or title)}"
+    d = config.DATA_DIR / "applications" / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _rel(p: Path | None) -> str | None:
+    """Store paths relative to the repo root so the DB stays portable."""
+    if p is None:
+        return None
+    try:
+        return str(p.relative_to(config.ROOT))
+    except ValueError:
+        return str(p)
 
 
 def _truncate(s: str, n: int = 70) -> str:
